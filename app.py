@@ -1768,9 +1768,9 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 def _make_anthropic_client():
-    """Return an Anthropic Bedrock client (credentials from environment/IAM)."""
+    """Return an Anthropic SDK client using the key from st.secrets."""
     import anthropic
-    return anthropic.AnthropicBedrock(aws_region="us-east-2")
+    return anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
 
 
 
@@ -2255,7 +2255,7 @@ Rules:
             try:
                 client = _make_anthropic_client()
                 _api_msg = client.messages.create(
-                    model=st.session_state.get("_selected_model", "us.anthropic.claude-sonnet-4-5"),
+                    model=st.session_state.get("_selected_model", "claude-sonnet-4-5"),
                     max_tokens=6000,
                     system=_system,
                     messages=_messages,
@@ -2376,7 +2376,10 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     handler.  Produces rich narrative log messages so users understand exactly
     what is happening at each stage.
     """
-    # Authentication via AWS IAM / ambient credentials — no API key needed
+    if not st.secrets.get("ANTHROPIC_API_KEY", ""):
+        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets. "
+                        "Add it to .streamlit/secrets.toml.")
+        return
 
 
     # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
@@ -2452,7 +2455,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             try:
                 client = _make_anthropic_client()
                 msg = client.messages.create(
-                    model="us.anthropic.claude-haiku-4-5-20251001",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=2000,
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     messages=[{"role": "user", "content": prompt}],
@@ -3027,7 +3030,7 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
         try:
             client = _make_anthropic_client()
             msg = client.messages.create(
-                model="us.anthropic.claude-haiku-4-5-20251001",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
@@ -3097,7 +3100,7 @@ def _fetch_image_for_query(query: str) -> bytes | None:
         client = _make_anthropic_client()
 
         msg = client.messages.create(
-            model="us.anthropic.claude-haiku-4-5-20251001",
+            model="claude-haiku-4-5-20251001",
             max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
@@ -3398,7 +3401,7 @@ Rules:
                 try:
                     client = _make_anthropic_client()
                     resp = client.messages.create(
-                        model="us.anthropic.claude-sonnet-4-6",
+                        model="claude-sonnet-4-6",
                         max_tokens=6000,
                         system=_system,
                         messages=_messages,
@@ -3858,9 +3861,9 @@ def _place_image_bytes(slide, img_bytes: bytes, x, y, w, h) -> None:
         buf = io.BytesIO(img_bytes); buf.seek(0)
     slide.shapes.add_picture(buf, Inches(x), Inches(y), Inches(w), Inches(h))
 
-def _extract_slide_json(image_b64: str, model: str) -> dict:
+def _extract_slide_json(image_b64: str, api_key: str, model: str) -> dict:
     import anthropic
-    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
+    client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model=model, max_tokens=4096,
         messages=[{"role":"user","content":[
@@ -3967,7 +3970,8 @@ def _render_element(slide, el: dict, page_raster=None) -> None:
 
 def pdf_to_editable_pptx(
     pdf_bytes: bytes,
-    model: str = "us.anthropic.claude-opus-4-5",
+    api_key: str,
+    model: str = "claude-opus-4-5",
     dpi: int = 150,
     progress_cb: Callable | None = None,
 ) -> tuple[bytes, list[str]]:
@@ -4009,7 +4013,7 @@ def pdf_to_editable_pptx(
         b64           = _page_to_b64(raster)
 
         try:
-            spec = _extract_slide_json(b64, model)
+            spec = _extract_slide_json(b64, api_key, model)
         except Exception as e:
             errors.append(f"Page {i+1}: extraction failed — {e}")
             slide = prs.slides.add_slide(blank)
@@ -4049,6 +4053,226 @@ def pdf_to_editable_pptx(
 
 # Alias for creator tab
 _pdf_to_pptx = pdf_to_editable_pptx
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH — OTP via AWS SES + signed URL token
+# Restricted to @segaamerica.com addresses only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLOWED_DOMAIN     = "@segaamerica.com"
+OTP_EXPIRY_SECS    = 600   # 10 minutes
+TOKEN_EXPIRY_DAYS  = 1     # signed URL token survives 1 day
+
+
+def _send_otp(email: str, code: str) -> bool:
+    """Send OTP via AWS SES. Returns True on success."""
+    try:
+        import boto3
+        ses = boto3.client(
+            "ses",
+            region_name=st.secrets.get("AWS_SES_REGION", "us-east-1"),
+            aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY_ID", ""),
+            aws_secret_access_key=st.secrets.get("AWS_SECRET_ACCESS_KEY", ""),
+        )
+        ses.send_email(
+            Source=st.secrets.get("EMAIL_FROM", "noreply@segaamerica.com"),
+            Destination={"ToAddresses": [email]},
+            Message={
+                "Subject": {"Data": "SEGA Slide Suite \u2014 Your verification code", "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {
+                        "Data": f"Your SEGA Slide Suite verification code is: {code}\n\nExpires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.",
+                        "Charset": "UTF-8",
+                    },
+                    "Html": {
+                        "Data": f"""
+                        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
+                                    background:#040A1C;border:1px solid #0033AA;border-top:3px solid #0055AA;
+                                    border-radius:10px;overflow:hidden;">
+                          <div style="padding:28px 32px 16px;border-bottom:1px solid rgba(0,102,204,0.3);">
+                            <div style="font-family:'Arial Black',Arial,sans-serif;font-size:26px;
+                                        font-weight:900;letter-spacing:.15em;color:#FFFFFF;">SEGA</div>
+                            <div style="font-size:11px;letter-spacing:.3em;color:#00CCFF;
+                                        text-transform:uppercase;margin-top:2px;">Slide Suite</div>
+                          </div>
+                          <div style="padding:28px 32px 32px;">
+                            <div style="font-size:14px;color:#D0E4FF;margin-bottom:20px;">
+                              Your verification code is:
+                            </div>
+                            <div style="font-size:44px;font-weight:900;letter-spacing:.2em;color:#FFFFFF;
+                                        background:rgba(0,85,170,0.35);border:1px solid rgba(0,204,255,0.3);
+                                        border-radius:8px;padding:16px 24px;display:inline-block;
+                                        margin-bottom:24px;font-family:'Arial Black',Arial,sans-serif;">
+                              {code}
+                            </div>
+                            <div style="font-size:12px;color:#8899BB;line-height:1.6;">
+                              Expires in 10 minutes.<br>
+                              If you didn't request this, you can safely ignore this email.
+                            </div>
+                          </div>
+                        </div>""",
+                        "Charset": "UTF-8",
+                    },
+                },
+            },
+        )
+        return True
+    except Exception as e:
+        st.error(f"Failed to send email: {e}")
+        return False
+
+
+def _make_token(email: str) -> str:
+    """Create a signed URL token valid for TOKEN_EXPIRY_DAYS."""
+    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+    expiry  = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
+    payload = f"{email}|{expiry}"
+    sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_token(token: str) -> str | None:
+    """Verify token. Returns email if valid and unexpired, else None."""
+    try:
+        secret   = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+        decoded  = base64.urlsafe_b64decode(token.encode()).decode()
+        email, expiry_str, sig = decoded.rsplit("|", 2)
+        payload  = f"{email}|{expiry_str}"
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return email
+    except Exception:
+        return None
+
+
+# ── Read token from URL on every page load ────────────────────────────────────
+_url_token   = st.query_params.get("t", "")
+_token_email = _verify_token(_url_token) if _url_token else None
+
+# ── Session state init ────────────────────────────────────────────────────────
+for _k, _v in [
+    ("auth_verified", False), ("auth_email", ""),
+    ("auth_token",    ""),
+    ("otp_code",      ""), ("otp_email", ""), ("otp_expiry", 0),
+    ("otp_sent",      False), ("otp_attempts", 0),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# If valid token in URL, auto-authenticate
+if _token_email and not st.session_state.auth_verified:
+    st.session_state.auth_verified = True
+    st.session_state.auth_email    = _token_email
+    st.session_state.auth_token    = _url_token
+
+# ── Login gate ────────────────────────────────────────────────────────────────
+if not st.session_state.auth_verified:
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@400;600&display=swap');
+    .login-outer{
+        min-height:80vh;display:flex;align-items:center;justify-content:center;
+        background:linear-gradient(135deg,#040A1C 0%,#0D1B3E 50%,#040A1C 100%);
+    }
+    .login-wrap{
+        max-width:420px;width:100%;padding:2.5rem 2rem;
+        background:rgba(0,30,80,0.6);
+        border:1px solid rgba(0,102,204,0.45);
+        border-top:3px solid #0055AA;
+        border-radius:12px;
+        backdrop-filter:blur(12px);
+        box-shadow:0 0 40px rgba(0,85,170,0.25);
+    }
+    .login-logo{
+        font-family:'Orbitron',monospace;font-size:2.4rem;font-weight:900;
+        letter-spacing:.15em;color:#FFFFFF;
+        text-shadow:0 0 20px #0055AA,0 0 40px #00CCFF;
+        margin-bottom:.2rem;text-align:center;
+    }
+    .login-sub{
+        font-family:'Orbitron',monospace;font-size:.65rem;font-weight:700;
+        letter-spacing:.35em;color:#00CCFF;text-transform:uppercase;
+        text-align:center;margin-bottom:.35rem;
+    }
+    .login-divider{ border:none;border-top:1px solid rgba(0,102,204,0.35);margin:1.2rem 0; }
+    .login-title{
+        font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:600;
+        color:#D0E4FF;text-align:center;margin-bottom:1.5rem;letter-spacing:.04em;
+    }
+    </style>
+    <div class="login-outer">
+      <div class="login-wrap">
+        <div class="login-logo">SEGA</div>
+        <div class="login-sub">Slide Suite</div>
+        <hr class="login-divider"/>
+        <div class="login-title">Sign in with your SEGA America email</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not st.session_state.otp_sent:
+        with st.form("login_form"):
+            _email_input = st.text_input("Email address", placeholder="you@segaamerica.com")
+            _send_btn    = st.form_submit_button("Send verification code", use_container_width=True)
+
+        if _send_btn and _email_input:
+            if not _email_input.strip().lower().endswith(ALLOWED_DOMAIN.lower()):
+                st.error(f"Only {ALLOWED_DOMAIN} addresses are allowed.")
+            else:
+                _code = str(abs(hash(f"{_email_input}{time.time()}")) % 900000 + 100000)
+                if _send_otp(_email_input.strip().lower(), _code):
+                    st.session_state.otp_code     = _code
+                    st.session_state.otp_email    = _email_input.strip().lower()
+                    st.session_state.otp_expiry   = time.time() + OTP_EXPIRY_SECS
+                    st.session_state.otp_sent     = True
+                    st.session_state.otp_attempts = 0
+                    st.rerun()
+    else:
+        st.info(f"Code sent to **{st.session_state.otp_email}** \u2014 check your inbox.")
+        with st.form("otp_form"):
+            _code_input = st.text_input("Enter 6-digit code", max_chars=6, key="auth_code_input")
+            _verify_btn = st.form_submit_button("Verify code", use_container_width=True, type="primary")
+
+        if _verify_btn and _code_input:
+            if st.session_state.otp_attempts >= 5:
+                st.error("Too many attempts. Please request a new code.")
+                st.session_state.otp_sent = False
+            elif time.time() > st.session_state.otp_expiry:
+                st.error("Code expired. Please request a new one.")
+                st.session_state.otp_sent = False
+            elif _code_input.strip() != st.session_state.otp_code:
+                st.session_state.otp_attempts += 1
+                _rem = 5 - st.session_state.otp_attempts
+                st.error(f"Incorrect code. {_rem} attempt{'s' if _rem != 1 else ''} remaining.")
+            else:
+                st.session_state.auth_verified = True
+                st.session_state.auth_email    = st.session_state.otp_email
+                st.session_state.otp_code      = ""
+                _token = _make_token(st.session_state.auth_email)
+                st.session_state.auth_token    = _token
+                st.query_params["t"] = _token
+                st.rerun()
+
+        _back_col, _ = st.columns([1, 1])
+        with _back_col:
+            if st.button("\u2190 Use a different email", key="auth_back"):
+                st.session_state.otp_sent = False
+                st.session_state.otp_code = ""
+                st.rerun()
+
+    st.markdown(
+        f"<div style='text-align:center;font-size:.72rem;color:#6080A8;margin-top:1rem'>"
+        f"Restricted to {ALLOWED_DOMAIN} addresses \u00b7 Codes expire after 10 minutes</div>",
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN APP (authenticated users only beyond this point)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SLIDE SUITE UI (ported from pptx_verifier_new.py)
@@ -4408,7 +4632,7 @@ End with **Overall Deck Score** (0–100) and top 3 highest-impact changes."""
 
 
 def analyze_slides_with_claude(slides, filename):
-    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
+    client = anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
     parts = []
     for s in slides:
         p = [f"## Slide {s['slide_num']}", f"**Title:** {s['title'] or '(no title)'}"]
@@ -4431,7 +4655,7 @@ def analyze_slides_with_claude(slides, filename):
 
     with st.spinner("Analyzing your presentation with Claude…"):
         msg = client.messages.create(
-            model="us.anthropic.claude-opus-4-5", max_tokens=4096,
+            model="claude-opus-4-5", max_tokens=4096,
             system=ACTION_FIRST_SYSTEM,
             messages=[{"role": "user", "content": prompt}])
     return msg.content[0].text
@@ -4442,7 +4666,7 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
     Optionally call Claude to enrich each slide's bullets and add takeaway blocks
     before generating the PPTX.
     """
-    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
+    client = anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
     import json as _json
     prompt = (
         f"You are a presentation expert. The user has provided a markdown outline for a presentation.\n"
@@ -4453,7 +4677,7 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
         + _json.dumps(outline, indent=2)
     )
     msg = client.messages.create(
-        model="us.anthropic.claude-sonnet-4-6", max_tokens=4096,
+        model="claude-sonnet-4-6", max_tokens=4096,
         messages=[{"role": "user", "content": prompt}])
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -4855,7 +5079,7 @@ with t_md:
 
                 try:
                     for _ev in _run_pipeline(
-                        model="us.anthropic.claude-sonnet-4-6",
+                        model="claude-sonnet-4-6",
                         uploaded_files=[],
                         topic=topic,
                         purpose=_md_purpose,
@@ -4973,7 +5197,7 @@ with t_create:
             _oc1, _oc2, _oc3 = st.columns(3)
             with _oc1:
                 _cr_model  = st.selectbox("Model",
-                    ["us.anthropic.claude-sonnet-4-6","us.anthropic.claude-opus-4-6","us.anthropic.claude-haiku-4-5-20251001"], key="cr_model")
+                    ["claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5-20251001"], key="cr_model")
                 _cr_web    = st.checkbox("Web research",
                                          value=st.session_state.get("proj_web_research", True), key="cr_web")
                 st.session_state["proj_web_research"] = _cr_web
@@ -5062,7 +5286,7 @@ with t_create:
                     try:
                         _mac = _make_anthropic_client
                         _grc = _mac().messages.create(
-                            model="us.anthropic.claude-sonnet-4-6", max_tokens=600, system=_gsys,
+                            model="claude-sonnet-4-6", max_tokens=600, system=_gsys,
                             messages=[{"role": m["role"], "content": m["content"]}
                                       for m in st.session_state["guided_messages"]],
                         )
@@ -5352,7 +5576,7 @@ with t_pdf:
             except Exception:
                 pass
         _pmd  = st.selectbox("Vision model",
-            ["us.anthropic.claude-opus-4-5","us.anthropic.claude-sonnet-4-5"], key="cr_pdf_model",
+            ["claude-opus-4-5","claude-sonnet-4-5"], key="cr_pdf_model",
             help="Opus = more accurate; Sonnet = faster.")
         _pdpi = st.select_slider("Render quality (DPI)",
             options=[96,120,150,200], value=150, key="cr_pdf_dpi")
@@ -5372,8 +5596,12 @@ with t_pdf:
         if not _HAS_P2P:
             st.error("pdf_to_pptx.py not found — place it in the same directory.")
         else:
-            _pup.seek(0); _praw = _pup.read()
-            _pprog = _pout.progress(0, "Starting…")
+            _akey = st.secrets.get("ANTHROPIC_API_KEY","")
+            if not _akey:
+                st.error("ANTHROPIC_API_KEY not set in .streamlit/secrets.toml.")
+            else:
+                _pup.seek(0); _praw = _pup.read()
+                _pprog = _pout.progress(0, "Starting…")
             _plog_ph = st.empty(); _pll = []
 
             def _plg(m):
@@ -5387,7 +5615,7 @@ with t_pdf:
                 import pypdf as _ppdf2
                 _npg = len(_ppdf2.PdfReader(io.BytesIO(_praw)).pages)
                 _plg(f"📄 {_npg} page(s) · sending to {_pmd}…")
-                _pout2, _perrs = _p2p(_praw, model=_pmd, dpi=_pdpi,
+                _pout2, _perrs = _p2p(_praw, api_key=_akey, model=_pmd, dpi=_pdpi,
                     progress_cb=lambda f: _pprog.progress(
                         min(f, 0.99),
                         text=f"Page {max(1, round(f*_npg))} of {_npg}…"))
