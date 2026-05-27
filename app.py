@@ -1768,9 +1768,13 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 def _make_anthropic_client():
-    """Return an Anthropic SDK client using the key from st.secrets."""
+    """Return an Anthropic Bedrock client using dedicated Bedrock credentials from st.secrets."""
     import anthropic
-    return anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+    return anthropic.AnthropicBedrock(
+        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
+        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
+        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
+    )
 
 
 
@@ -2255,7 +2259,7 @@ Rules:
             try:
                 client = _make_anthropic_client()
                 _api_msg = client.messages.create(
-                    model=st.session_state.get("_selected_model", "claude-sonnet-4-5"),
+                    model=st.session_state.get("_selected_model", "us.anthropic.claude-sonnet-4-5"),
                     max_tokens=6000,
                     system=_system,
                     messages=_messages,
@@ -2376,10 +2380,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     handler.  Produces rich narrative log messages so users understand exactly
     what is happening at each stage.
     """
-    if not st.secrets.get("ANTHROPIC_API_KEY", ""):
-        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets. "
-                        "Add it to .streamlit/secrets.toml.")
-        return
+    # Bedrock auth via IAM role / ambient AWS credentials — no API key needed
 
 
     # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
@@ -2455,7 +2456,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             try:
                 client = _make_anthropic_client()
                 msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
+                    model="us.anthropic.claude-haiku-4-5-20251001",
                     max_tokens=2000,
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     messages=[{"role": "user", "content": prompt}],
@@ -3030,7 +3031,7 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
         try:
             client = _make_anthropic_client()
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="us.anthropic.claude-haiku-4-5-20251001",
                 max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
@@ -3100,7 +3101,7 @@ def _fetch_image_for_query(query: str) -> bytes | None:
         client = _make_anthropic_client()
 
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="us.anthropic.claude-haiku-4-5-20251001",
             max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
@@ -3401,7 +3402,7 @@ Rules:
                 try:
                     client = _make_anthropic_client()
                     resp = client.messages.create(
-                        model="claude-sonnet-4-6",
+                        model="us.anthropic.claude-sonnet-4-6",
                         max_tokens=6000,
                         system=_system,
                         messages=_messages,
@@ -3861,9 +3862,13 @@ def _place_image_bytes(slide, img_bytes: bytes, x, y, w, h) -> None:
         buf = io.BytesIO(img_bytes); buf.seek(0)
     slide.shapes.add_picture(buf, Inches(x), Inches(y), Inches(w), Inches(h))
 
-def _extract_slide_json(image_b64: str, api_key: str, model: str) -> dict:
+def _extract_slide_json(image_b64: str, model: str) -> dict:
     import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.AnthropicBedrock(
+        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
+        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
+        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
+    )
     msg = client.messages.create(
         model=model, max_tokens=4096,
         messages=[{"role":"user","content":[
@@ -3970,8 +3975,7 @@ def _render_element(slide, el: dict, page_raster=None) -> None:
 
 def pdf_to_editable_pptx(
     pdf_bytes: bytes,
-    api_key: str,
-    model: str = "claude-opus-4-5",
+    model: str = "us.anthropic.claude-opus-4-5",
     dpi: int = 150,
     progress_cb: Callable | None = None,
 ) -> tuple[bytes, list[str]]:
@@ -4013,7 +4017,7 @@ def pdf_to_editable_pptx(
         b64           = _page_to_b64(raster)
 
         try:
-            spec = _extract_slide_json(b64, api_key, model)
+            spec = _extract_slide_json(b64, model)
         except Exception as e:
             errors.append(f"Page {i+1}: extraction failed — {e}")
             slide = prs.slides.add_slide(blank)
@@ -4632,7 +4636,12 @@ End with **Overall Deck Score** (0–100) and top 3 highest-impact changes."""
 
 
 def analyze_slides_with_claude(slides, filename):
-    client = anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+    import anthropic
+    client = anthropic.AnthropicBedrock(
+        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
+        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
+        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
+    )
     parts = []
     for s in slides:
         p = [f"## Slide {s['slide_num']}", f"**Title:** {s['title'] or '(no title)'}"]
@@ -4655,7 +4664,7 @@ def analyze_slides_with_claude(slides, filename):
 
     with st.spinner("Analyzing your presentation with Claude…"):
         msg = client.messages.create(
-            model="claude-opus-4-5", max_tokens=4096,
+            model="us.anthropic.claude-opus-4-5", max_tokens=4096,
             system=ACTION_FIRST_SYSTEM,
             messages=[{"role": "user", "content": prompt}])
     return msg.content[0].text
@@ -4666,7 +4675,12 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
     Optionally call Claude to enrich each slide's bullets and add takeaway blocks
     before generating the PPTX.
     """
-    client = anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+    import anthropic
+    client = anthropic.AnthropicBedrock(
+        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
+        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
+        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
+    )
     import json as _json
     prompt = (
         f"You are a presentation expert. The user has provided a markdown outline for a presentation.\n"
@@ -4677,7 +4691,7 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
         + _json.dumps(outline, indent=2)
     )
     msg = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=4096,
+        model="us.anthropic.claude-sonnet-4-6", max_tokens=4096,
         messages=[{"role": "user", "content": prompt}])
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -5079,7 +5093,7 @@ with t_md:
 
                 try:
                     for _ev in _run_pipeline(
-                        model="claude-sonnet-4-6",
+                        model="us.anthropic.claude-sonnet-4-6",
                         uploaded_files=[],
                         topic=topic,
                         purpose=_md_purpose,
@@ -5197,7 +5211,7 @@ with t_create:
             _oc1, _oc2, _oc3 = st.columns(3)
             with _oc1:
                 _cr_model  = st.selectbox("Model",
-                    ["claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5-20251001"], key="cr_model")
+                    ["us.anthropic.claude-sonnet-4-6","us.anthropic.claude-opus-4-6","us.anthropic.claude-haiku-4-5-20251001"], key="cr_model")
                 _cr_web    = st.checkbox("Web research",
                                          value=st.session_state.get("proj_web_research", True), key="cr_web")
                 st.session_state["proj_web_research"] = _cr_web
@@ -5286,7 +5300,7 @@ with t_create:
                     try:
                         _mac = _make_anthropic_client
                         _grc = _mac().messages.create(
-                            model="claude-sonnet-4-6", max_tokens=600, system=_gsys,
+                            model="us.anthropic.claude-sonnet-4-6", max_tokens=600, system=_gsys,
                             messages=[{"role": m["role"], "content": m["content"]}
                                       for m in st.session_state["guided_messages"]],
                         )
@@ -5576,7 +5590,7 @@ with t_pdf:
             except Exception:
                 pass
         _pmd  = st.selectbox("Vision model",
-            ["claude-opus-4-5","claude-sonnet-4-5"], key="cr_pdf_model",
+            ["us.anthropic.claude-opus-4-5","us.anthropic.claude-sonnet-4-5"], key="cr_pdf_model",
             help="Opus = more accurate; Sonnet = faster.")
         _pdpi = st.select_slider("Render quality (DPI)",
             options=[96,120,150,200], value=150, key="cr_pdf_dpi")
@@ -5596,12 +5610,8 @@ with t_pdf:
         if not _HAS_P2P:
             st.error("pdf_to_pptx.py not found — place it in the same directory.")
         else:
-            _akey = st.secrets.get("ANTHROPIC_API_KEY","")
-            if not _akey:
-                st.error("ANTHROPIC_API_KEY not set in .streamlit/secrets.toml.")
-            else:
-                _pup.seek(0); _praw = _pup.read()
-                _pprog = _pout.progress(0, "Starting…")
+            _pup.seek(0); _praw = _pup.read()
+            _pprog = _pout.progress(0, "Starting…")
             _plog_ph = st.empty(); _pll = []
 
             def _plg(m):
@@ -5615,7 +5625,7 @@ with t_pdf:
                 import pypdf as _ppdf2
                 _npg = len(_ppdf2.PdfReader(io.BytesIO(_praw)).pages)
                 _plg(f"📄 {_npg} page(s) · sending to {_pmd}…")
-                _pout2, _perrs = _p2p(_praw, api_key=_akey, model=_pmd, dpi=_pdpi,
+                _pout2, _perrs = _p2p(_praw, model=_pmd, dpi=_pdpi,
                     progress_cb=lambda f: _pprog.progress(
                         min(f, 0.99),
                         text=f"Page {max(1, round(f*_npg))} of {_npg}…"))
