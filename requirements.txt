@@ -1,0 +1,13 @@
+streamlit
+anthropic
+python-pptx
+pandas
+lxml
+pypdf
+Pillow
+PyMuPDF
+matplotlib
+numpy
+markitdown
+streamlit-sortables
+boto3
