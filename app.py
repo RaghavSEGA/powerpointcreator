@@ -1779,6 +1779,12 @@ def _make_anthropic_client():
     )
 
 
+def _make_search_client():
+    """Direct Anthropic API client — web search tool only available here, not on Bedrock."""
+    import anthropic
+    return anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+
+
 
 # ── Plan modal ───────────────────────────────────────────────────────────────
 
@@ -2456,9 +2462,9 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
 
         def _do_fetch():
             try:
-                client = _make_anthropic_client()
+                client = _make_search_client()
                 msg = client.messages.create(
-                    model="us.anthropic.claude-haiku-4-5-20251001",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=2000,
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     messages=[{"role": "user", "content": prompt}],
@@ -3033,9 +3039,9 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 
     def _fetch():
         try:
-            client = _make_anthropic_client()
+            client = _make_search_client()
             msg = client.messages.create(
-                model="us.anthropic.claude-haiku-4-5-20251001",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
@@ -3102,10 +3108,10 @@ def _fetch_image_for_query(query: str) -> bytes | None:
     try:
         import urllib.request, re as _re
 
-        client = _make_anthropic_client()
+        client = _make_search_client()
 
         msg = client.messages.create(
-            model="us.anthropic.claude-haiku-4-5-20251001",
+            model="claude-haiku-4-5-20251001",
             max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
@@ -3859,11 +3865,7 @@ def _place_image_bytes(slide, img_bytes: bytes, x, y, w, h) -> None:
 
 def _extract_slide_json(image_b64: str, model: str) -> dict:
     import anthropic
-    client = anthropic.AnthropicBedrock(
-        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
-        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
-        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
-    )
+    client = _make_anthropic_client()
     msg = client.messages.create(
         model=model, max_tokens=4096,
         messages=[{"role":"user","content":[
@@ -4495,22 +4497,28 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
     """
     Parse a markdown document into a slide outline list.
     Convention:
-      # H1      → deck title (skipped as a slide, used as topic)
-      ## H2     → slide title
-      ### H3    → sub-section within a slide (treated as a bold bullet)
-      - / * / + → bullet points
-      > text    → takeaway / callout block
-      **text**  → kept as-is (bold)
-      plain     → body paragraph
-      ---       → explicit slide break (optional)
-    Returns list of dicts: {title, bullets, takeaway, notes}
+      # H1        → deck title (skipped as a slide, used as topic)
+      ## H2       → slide title
+      ### H3      → sub-section within a slide (treated as a bold bullet)
+      - / * / +   → bullet points
+      > text      → takeaway / callout block
+      **text**    → kept as-is (bold)
+      plain text  → body paragraph (first plain line per slide = subtitle)
+      ---         → explicit slide break (optional)
+      ::chart::   → chart block (YAML-style, ended by ::end::)
+                    fields: type, title, source, categories (CSV), series (name: v,v,v)
+    Returns list of dicts: {title, subtitle, bullets, takeaway, notes, chart}
     """
     slides = []
     current: dict | None = None
 
     def flush():
-        if current and (current["title"] or current["bullets"]):
+        if current and (current["title"] or current["bullets"] or current.get("chart")):
             slides.append(dict(current))
+
+    def _new_slide(title=""):
+        return {"title": title, "subtitle": "", "bullets": [],
+                "takeaway": "", "notes": "", "chart": None}
 
     lines = md_text.splitlines()
     i = 0
@@ -4521,7 +4529,7 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # Explicit slide break
         if stripped in ("---", "***", "___"):
             flush()
-            current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
+            current = _new_slide()
             i += 1; continue
 
         # H1 — deck title, skip as a slide
@@ -4531,13 +4539,13 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # H2 — new slide
         if stripped.startswith("## "):
             flush()
-            current = {"title": stripped[3:].strip(), "bullets": [], "takeaway": "", "notes": ""}
+            current = _new_slide(stripped[3:].strip())
             i += 1; continue
 
         # H3 — sub-heading within slide → bold bullet
         if stripped.startswith("### "):
             if current is None:
-                current = {"title": stripped[4:].strip(), "bullets": [], "takeaway": "", "notes": ""}
+                current = _new_slide(stripped[4:].strip())
             else:
                 current["bullets"].append(f"**{stripped[4:].strip()}**")
             i += 1; continue
@@ -4545,21 +4553,64 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # Blockquote → takeaway
         if stripped.startswith("> "):
             if current is None:
-                current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
+                current = _new_slide()
             current["takeaway"] = stripped[2:].strip()
             i += 1; continue
+
+        # ::chart:: block — parse until ::end::
+        if stripped == "::chart::":
+            if current is None:
+                current = _new_slide()
+            chart = {"chart_type": "bar", "title": "", "source": "",
+                     "categories": [], "series": [], "colors": []}
+            i += 1
+            current_series_name = None
+            while i < len(lines) and lines[i].strip() != "::end::":
+                cl = lines[i]
+                cs = cl.strip()
+                if cs.startswith("type:"):
+                    chart["chart_type"] = cs.split(":", 1)[1].strip()
+                elif cs.startswith("title:"):
+                    chart["title"] = cs.split(":", 1)[1].strip()
+                elif cs.startswith("source:"):
+                    chart["source"] = cs.split(":", 1)[1].strip()
+                    if chart["source"] and chart["source"] not in (current.get("bullets") or []):
+                        pass  # stored in chart, used for sources field
+                elif cs.startswith("categories:"):
+                    chart["categories"] = [c.strip() for c in cs.split(":", 1)[1].split(",")]
+                elif cs.startswith("series:"):
+                    pass  # section header, series lines follow
+                elif ":" in cs and not cs.startswith("#"):
+                    # "  SeriesName: v1, v2, v3"
+                    name, vals_str = cs.split(":", 1)
+                    try:
+                        vals = [float(v.strip().replace(",","")) for v in vals_str.split(",") if v.strip()]
+                        chart["series"].append({"label": name.strip(), "values": vals})
+                    except ValueError:
+                        pass
+                i += 1
+            if i < len(lines):
+                i += 1  # skip ::end::
+            current["chart"] = chart
+            # Also add chart source to bullets if present
+            if chart.get("source"):
+                current["bullets"].append(f"Source: {chart['source']}")
+            continue
 
         # Bullet
         if re.match(r"^[-*+] ", stripped) or re.match(r"^\d+\. ", stripped):
             if current is None:
-                current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
+                current = _new_slide()
             text = re.sub(r"^[-*+] |^\d+\. ", "", stripped)
             current["bullets"].append(text)
             i += 1; continue
 
-        # Non-empty plain line → body paragraph as bullet
+        # Non-empty plain line — first one = subtitle, rest = bullets
         if stripped and current is not None:
-            current["bullets"].append(stripped)
+            if not current["subtitle"]:
+                current["subtitle"] = stripped
+            else:
+                current["bullets"].append(stripped)
 
         i += 1
 
@@ -4568,22 +4619,39 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
 
 
 def outline_to_slide_json(outline: list[dict], topic: str = "") -> dict:
-    """Convert parsed outline into the slide_json format used by pptx_creator."""
+    """Convert parsed outline into the slide_json format used by generate_pptx."""
     slides_out = []
     for idx, sl in enumerate(outline):
-        bullets = sl.get("bullets", [])
+        bullets  = list(sl.get("bullets", []))
         takeaway = sl.get("takeaway", "")
         if takeaway:
             bullets = bullets + [f"**Key Takeaway:** {takeaway}"]
-        slides_out.append({
+
+        chart = sl.get("chart")
+        slide_type = "chart" if chart else "bullets"
+
+        entry: dict = {
             "slide_number": idx + 1,
-            "title": sl.get("title", f"Slide {idx + 1}"),
-            "bullets": bullets,
-            "notes": sl.get("notes", ""),
-        })
+            "type":         slide_type,
+            "title":        sl.get("title", f"Slide {idx + 1}"),
+            "subtitle":     sl.get("subtitle", ""),
+            "bullets":      bullets,
+            "notes":        sl.get("notes", ""),
+            "sources":      [chart["source"]] if chart and chart.get("source") else [],
+        }
+        if chart:
+            entry["chart"] = {
+                "chart_type": chart.get("chart_type", "bar"),
+                "title":      chart.get("title", ""),
+                "categories": chart.get("categories", []),
+                "series":     chart.get("series", []),
+                "colors":     chart.get("colors", []),
+            }
+        slides_out.append(entry)
+
     return {
-        "topic": topic,
-        "slides": slides_out,
+        "topic":        topic,
+        "slides":       slides_out,
         "total_slides": len(slides_out),
     }
 
@@ -4634,11 +4702,7 @@ End with **Overall Deck Score** (0–100) and top 3 highest-impact changes."""
 
 def analyze_slides_with_claude(slides, filename):
     import anthropic
-    client = anthropic.AnthropicBedrock(
-        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
-        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
-        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
-    )
+    client = _make_anthropic_client()
     parts = []
     for s in slides:
         p = [f"## Slide {s['slide_num']}", f"**Title:** {s['title'] or '(no title)'}"]
@@ -4673,11 +4737,7 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
     before generating the PPTX.
     """
     import anthropic
-    client = anthropic.AnthropicBedrock(
-        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
-        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
-        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
-    )
+    client = _make_anthropic_client()
     import json as _json
     prompt = (
         f"You are a presentation expert. The user has provided a markdown outline for a presentation.\n"
@@ -4810,6 +4870,72 @@ def _render_slide_preview(outline: list[dict], editable: bool = False, ns: str =
                     st.markdown("---", unsafe_allow_html=False)
     return result
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# PPTX VISUAL PREVIEW — LibreOffice → PDF → fitz rasterization
+# ═══════════════════════════════════════════════════════════════
+
+def _pptx_to_slide_images(pptx_bytes: bytes, dpi: int = 120) -> list[bytes]:
+    """
+    Convert PPTX bytes → list of PNG bytes (one per slide).
+    Uses LibreOffice headless for PPTX→PDF, then fitz for rasterization.
+    Returns [] if conversion fails.
+    """
+    import subprocess, tempfile, os
+    try:
+        import fitz as _fitz
+    except ImportError:
+        return []
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            pptx_path = os.path.join(tmp, "deck.pptx")
+            pdf_path  = os.path.join(tmp, "deck.pdf")
+
+            with open(pptx_path, "wb") as f:
+                f.write(pptx_bytes)
+
+            r = subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", tmp, pptx_path],
+                capture_output=True, timeout=60
+            )
+            if not os.path.exists(pdf_path):
+                return []
+
+            scale = dpi / 72
+            mat   = _fitz.Matrix(scale, scale)
+            doc   = _fitz.open(pdf_path)
+            pages = [doc[i].get_pixmap(matrix=mat).tobytes("png")
+                     for i in range(len(doc))]
+            doc.close()
+            return pages
+    except Exception:
+        return []
+
+
+def _render_pptx_visual_preview(pptx_bytes: bytes) -> None:
+    """Render a visual thumbnail grid of all slides in the PPTX."""
+    with st.spinner("Rendering slide thumbnails…"):
+        pages = _pptx_to_slide_images(pptx_bytes, dpi=120)
+
+    if not pages:
+        st.info("Visual preview unavailable — LibreOffice or PyMuPDF not accessible on this host.")
+        return
+
+    st.markdown(
+        f"<div style='font-size:.75rem;color:#64748b;margin-bottom:.5rem'>"
+        f"{len(pages)} slide{'s' if len(pages)!=1 else ''}</div>",
+        unsafe_allow_html=True)
+
+    cols_per_row = 3
+    for row_start in range(0, len(pages), cols_per_row):
+        row_pages = pages[row_start:row_start + cols_per_row]
+        cols = st.columns(len(row_pages), gap="small")
+        for col, (png, idx) in zip(cols, [(p, row_start + i) for i, p in enumerate(row_pages)]):
+            with col:
+                st.image(png, caption=f"Slide {idx + 1}", use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5148,6 +5274,9 @@ with t_md:
                     file_name=st.session_state.get("md_pptx_filename", "presentation.pptx"),
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True)
+
+                st.markdown("#### 🖼 Slide Preview")
+                _render_pptx_visual_preview(st.session_state["md_pptx_bytes"])
 
                 # Sources
                 _srcs = st.session_state.get("research_sources", [])
