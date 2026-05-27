@@ -2732,6 +2732,7 @@ Output a single JSON object. Schema:
         "series":[{{"label":"...","values":[0.0]}}],
         "colors":["hex"]
       }},
+      "sources":["Source name / URL — used for facts on this slide"],
       "speaker_notes":"..."
     }}
   ]
@@ -2739,7 +2740,6 @@ Output a single JSON object. Schema:
 
 Rules:
 - Use REAL data from documents and research — no placeholders
-- Supply sources as well for all of the documents/research.
 - Be specific and data-driven for {audience}
 - theme.primary and theme.accent must be dark-to-mid vivid hex colours (6 digits, no #).
   Never use white, near-white, or light pastels (no values above DDDDDD).
@@ -2748,7 +2748,9 @@ Rules:
 - Bullets: max 6 per slide, each under 15 words
 - Comparison rows: max 8 per slide
 - If multiple reference games are provided, you may produce one comparison slide per game, or a multi-column comparison slide covering all of them. Use the game title(s) as the right_title in comparison slides.
-- Use "chart" type when the business question or uploaded data suggests a chart would be clearer than a table. Populate chart.series with real numeric data extracted from documents or research.
+- Use "chart" type whenever data allows — populate chart.series with real numeric values from documents or research. Charts are strongly preferred over bullet lists for quantitative information.
+- DO NOT mention AI, machine learning, or related technology unless the topic or business question explicitly concerns it. Focus solely on the subject matter requested.
+- Every slide must include a "sources" field: a list of strings citing where each fact/stat came from (e.g. "Newzoo Global Games Report 2025", "Company earnings call Q4 2025"). Use empty list [] only if a slide is purely structural (title, section divider).
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
     raw_chunks   = []
@@ -5053,6 +5055,12 @@ with t_md:
 
         st.divider()
 
+        # ── Slide preview ─────────────────────────────────────
+        st.markdown("### 🗂 Slide Preview")
+        st.caption("Review your slides before generating. Titles and bullets are editable inline.")
+        outline = _render_slide_preview(outline, editable=True, ns="md_prev")
+        st.divider()
+
         # ── Claude augmentation ───────────────────────────────
         if md_augment and not st.session_state.get("md_augmented") and _creator_ok:
             if st.button("✨ Augment with Claude first", key="md_augment_btn", use_container_width=True):
@@ -5090,14 +5098,12 @@ with t_md:
                     for _ev in _run_pipeline(
                         model="us.anthropic.claude-sonnet-4-6",
                         uploaded_files=[],
-                        topic=topic,
-                        purpose=_md_purpose,
-                        industry="",
+                        game_title=topic,
+                        business_question="",
                         audience="General audience",
-                        question="",
+                        theme_preset=_md_theme_nm,
                         web_search_en=False,
                         slide_count=n,
-                        theme=_md_theme,
                         template_bytes=_tpl_bytes,
                         plan_mode=False,
                     ):
@@ -5119,6 +5125,15 @@ with t_md:
                             _slug = re.sub(r"[^a-zA-Z0-9]+", "_", topic)[:50]
                             st.session_state["md_pptx_bytes"]    = _ev[1]
                             st.session_state["md_pptx_filename"] = f"{_slug}.pptx"
+                            # Harvest per-slide sources from plan_slide_data
+                            _ssrc = {}
+                            for _sl in (st.session_state.get("plan_slide_data", {}).get("slides") or []):
+                                _snum = str(_sl.get("slide_number", _sl.get("slide_num", "")))
+                                _slsrc = _sl.get("sources", [])
+                                if _snum and _slsrc:
+                                    _ssrc[_snum] = _slsrc
+                            if _ssrc:
+                                st.session_state["slide_sources"] = _ssrc
                         elif _et == "error":
                             st.error(_ev[1], icon="🚨"); break
                 except Exception as _mex:
@@ -5137,9 +5152,17 @@ with t_md:
                 # Sources
                 _srcs = st.session_state.get("research_sources", [])
                 if _srcs:
-                    with st.expander(f"🔗 {len(_srcs)} source(s) used"):
+                    with st.expander(f"🔗 {len(_srcs)} web source(s) used"):
                         for _s in _srcs:
                             st.markdown(f"- [{_s.get('title',_s.get('url',''))}]({_s.get('url','')})")
+                _slide_srcs = st.session_state.get("slide_sources", {})
+                if _slide_srcs:
+                    with st.expander(f"📚 Per-slide sources ({sum(len(v) for v in _slide_srcs.values())} citations)"):
+                        for _sn, _ssl in sorted(_slide_srcs.items()):
+                            if _ssl:
+                                st.markdown(f"**Slide {_sn}**")
+                                for _sc in _ssl:
+                                    st.markdown(f"  - {_sc}")
 
                 if st.button("🔄 Start a new outline", key="md_reset"):
                     for _k in ["md_outline","md_topic","md_slide_data","md_augmented",
@@ -5378,11 +5401,13 @@ with t_create:
                     _glogs = []
                     for _ev in _run_pipeline(
                         model=_cr_model, uploaded_files=[],
-                        topic=_gtopic, purpose=_gp.get("purpose","General / Other"),
-                        industry=_gp.get("industry",""), audience=_gp.get("audience","General audience"),
-                        question=_gp.get("question",""), web_search_en=_cr_web,
+                        game_title=_gtopic,
+                        business_question=_gp.get("question",""),
+                        audience=_gp.get("audience","General audience"),
+                        theme_preset=st.session_state.get("cr_theme", list(THEME_PRESETS.keys())[0]),
+                        web_search_en=_cr_web,
                         slide_count=int(_gp.get("slide_count",10)),
-                        theme=_cr_theme, template_bytes=_gt, plan_mode=True,
+                        template_bytes=_gt, plan_mode=True,
                     ):
                         _et = _ev[0]
                         if _et in ("log","spinner"):
@@ -5484,10 +5509,12 @@ with t_create:
                             try:
                                 for _ev2 in _run_pipeline(
                                     model=_cr_model, uploaded_files=_uploads or [],
-                                    topic=_topic, purpose=_purpose,
-                                    industry=_industry, audience=_audience,
-                                    question=_question, web_search_en=_cr_web,
-                                    slide_count=_cr_slides, theme=_cr_theme,
+                                    game_title=_topic,
+                                    business_question=_question,
+                                    audience=_audience,
+                                    theme_preset=st.session_state.get("cr_theme", list(THEME_PRESETS.keys())[0]),
+                                    web_search_en=_cr_web,
+                                    slide_count=_cr_slides,
                                     template_bytes=_tpl2, plan_mode=True,
                                 ):
                                     _et2 = _ev2[0]
