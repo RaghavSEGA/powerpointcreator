@@ -6,6 +6,7 @@ Auth handled externally via Entra.
 from __future__ import annotations
 import streamlit as st
 import anthropic
+import base64
 import base64 as _base64
 import copy
 import hashlib
@@ -2463,11 +2464,14 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         def _do_fetch():
             try:
                 client = _make_search_client()
+                if not client.api_key:
+                    return f"[Web search skipped: ANTHROPIC_API_KEY not set in secrets]"
                 msg = client.messages.create(
                     model="claude-haiku-4-5-20251001",
                     max_tokens=2000,
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     messages=[{"role": "user", "content": prompt}],
+                    timeout=80.0,
                 )
                 return "\n".join(
                     b.text for b in msg.content
@@ -3040,11 +3044,14 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
     def _fetch():
         try:
             client = _make_search_client()
+            if not client.api_key:
+                return "[Web search skipped: ANTHROPIC_API_KEY not set in secrets]", []
             msg = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
+                timeout=80.0,
             )
 
             full_text = "\n".join(
@@ -3113,6 +3120,7 @@ def _fetch_image_for_query(query: str) -> bytes | None:
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
+            timeout=30.0,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
                 "role": "user",
