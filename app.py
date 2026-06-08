@@ -6,11 +6,8 @@ Auth handled externally via Entra.
 from __future__ import annotations
 import streamlit as st
 import anthropic
-import base64
 import base64 as _base64
 import copy
-import hashlib
-import hmac
 import io
 import json
 import os
@@ -1771,19 +1768,9 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 def _make_anthropic_client():
-    """Return an Anthropic Bedrock client using dedicated Bedrock credentials from st.secrets."""
+    """Return an Anthropic Bedrock client (credentials from environment/IAM)."""
     import anthropic
-    return anthropic.AnthropicBedrock(
-        aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-2"),
-        aws_access_key=st.secrets.get("AWS_BEDROCK_ACCESS_KEY_ID", ""),
-        aws_secret_key=st.secrets.get("AWS_BEDROCK_SECRET_ACCESS_KEY", ""),
-    )
-
-
-def _make_search_client():
-    """Direct Anthropic API client — web search tool only available here, not on Bedrock."""
-    import anthropic
-    return anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+    return anthropic.AnthropicBedrock(aws_region="us-east-2")
 
 
 
@@ -2381,15 +2368,16 @@ Rules:
 
 # ── run_pipeline generator ───────────────────────────────────────────────────
 
-def run_pipeline(model, uploaded_files, game_title, business_question, audience,
-                 theme_preset, web_search_en, slide_count, template_bytes=None,
-                 data_files=None, plan_mode=False):
+def run_pipeline(model, uploaded_files, topic, question, audience,
+                 theme, web_search_en, slide_count, template_bytes=None,
+                 data_files=None, plan_mode=False, purpose="General / Other",
+                 industry=""):
     """
     Generator yielding (event_type, payload) tuples consumed by the run-button
     handler.  Produces rich narrative log messages so users understand exactly
     what is happening at each stage.
     """
-    # Bedrock auth via IAM role / ambient AWS credentials — no API key needed
+    # Authentication via AWS IAM / ambient credentials — no API key needed
 
 
     # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
@@ -2401,25 +2389,16 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "Content is capped at {:,} characters to stay within API token limits.</span>"
     ).format(_MAX_DOC_CHARS))
 
-    # Parse comma-separated game titles into a clean list
-    game_titles = [g.strip() for g in (game_title or "").split(",") if g.strip()]
-    game_title_display = ", ".join(game_titles) if game_titles else ""
-
-    if web_search_en and game_titles:
-        _n_games = len(game_titles)
+    if web_search_en and topic.strip():
         yield ("spinner", (
             "🔍 <b>Stage 2 of 4 — Web research running in parallel</b><br>"
             "<span class='log-detail'>While your documents are being extracted, Claude is "
             "simultaneously searching the web for <i>{}</i>. "
-            "{}"
-            "Each search has a 90s wall-clock deadline — falls back to model knowledge if it times out.</span>"
-        ).format(
-            game_title_display,
-            f"{_n_games} parallel searches running. " if _n_games > 1 else ""
-        ))
+            "Search has a 90s wall-clock deadline — falls back to model knowledge if it times out.</span>"
+        ).format(topic))
 
     combined_docs  = "[No documents uploaded]"
-    research_text  = "[No reference game specified]"
+    research_text  = "[No web research performed]"
     _file_stats    = []  # list of (name, chars) for the log
 
     def _extract_docs():
@@ -2436,121 +2415,41 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             full = full[:_MAX_DOC_CHARS] + "\n\n[... document content trimmed to fit token budget ...]"
         return full
 
-    def _web_research_one(title: str) -> str:
-        """Fetch competitive intel using the Anthropic SDK with a hard timeout."""
-        if not web_search_en:
-            return f"[Web search disabled — using model knowledge for '{title}']"
+    def _do_research():
+        if not web_search_en or not topic.strip():
+            return "[Web search disabled — using model knowledge]", []
+        return _web_research(topic, purpose, industry, question)
 
-        from concurrent.futures import ThreadPoolExecutor as _TPE, TimeoutError as _FTE
-
-        HARD_TIMEOUT = 90  # wall-clock seconds enforced via future.result()
-
-        prompt = (
-            f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
-            "Search the web for current information and write a structured report covering:\n\n"
-            "OVERVIEW: Developer, publisher, release date, platforms, genre, launch price.\n\n"
-            "CRITICAL RECEPTION: Metacritic score (critic + user), scores from 3-4 named outlets "
-            "(IGN, GameSpot, Eurogamer etc). 4 specific things reviewers praised and 4 they criticised.\n\n"
-            "COMMERCIAL PERFORMANCE: Launch window sales, lifetime sales if available, "
-            "publisher statements, chart positions.\n\n"
-            "GAMEPLAY & FEATURES: 5-6 core mechanics in 1-2 sentences each. "
-            "Story length estimate. Any multiplayer or co-op features.\n\n"
-            "POST-LAUNCH: Notable DLC or updates released.\n\n"
-            "MARKET CONTEXT: 2-3 biggest competitor titles in the same window. "
-            "How it compares to the previous franchise entry.\n\n"
-            "Use real numbers throughout. Aim for 650-750 words total."
-        )
-
-        def _do_fetch():
-            try:
-                client = _make_search_client()
-                if not client.api_key:
-                    return f"[Web search skipped: ANTHROPIC_API_KEY not set in secrets]"
-                msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=2000,
-                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=80.0,
-                )
-                return "\n".join(
-                    b.text for b in msg.content
-                    if hasattr(b, "type") and b.type == "text" and b.text
-                ) or f"[No web results for '{title}']"
-            except Exception as e:
-                return f"[Web search error: {e}]"
-
-        _ex = _TPE(max_workers=1)
-        _fut = _ex.submit(_do_fetch)
-        try:
-            return _fut.result(timeout=HARD_TIMEOUT)
-        except _FTE:
-            return (
-                f"[Web search timed out after {HARD_TIMEOUT}s. "
-                f"Using Claude's training knowledge for '{title}' instead.]"
-            )
-        except Exception as e:
-            return f"[Web search error: {e}]"
-        finally:
-            _ex.shutdown(wait=False)
-
-
-    # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
-    # One future per game title (parallel searches) + one for doc extraction.
-    # Poll every 3 s to keep Streamlit alive with heartbeat spinner ticks.
-    # Hard wall-clock cap: if any game future exceeds RESEARCH_CAP seconds,
-    # cancel it and move on — future.result(timeout) enforces this per-game,
-    # but we also track total elapsed here as a belt-and-suspenders guard.
+    # ── Poll doc-extraction + web research in parallel ────────────────────────
     RESEARCH_CAP = 100  # seconds — bail out of a stalled future
-    _n_workers = 1 + max(len(game_titles), 1)
-    with ThreadPoolExecutor(max_workers=_n_workers) as pool:
-        fut_docs   = pool.submit(_extract_docs)
-        game_futs  = {pool.submit(_web_research_one, t): t for t in game_titles}
+    sources: list[dict] = []
 
-        pending       = {fut_docs: "__docs__"}
-        pending.update(game_futs)
-        docs_done     = False
-        research_done = not bool(game_titles)
-        game_results  = {}   # title -> research text
-        elapsed       = 0
-        TICK          = 2   # poll every 2s for more responsive UI
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_docs     = pool.submit(_extract_docs)
+        fut_research = pool.submit(_do_research)
+
+        pending  = {fut_docs: "__docs__", fut_research: "__research__"}
+        elapsed  = 0
+        TICK     = 2
 
         while pending:
             resolved = [(f, l) for f, l in list(pending.items()) if f.done()]
 
-            # Hard cap: if any game future has been running longer than RESEARCH_CAP,
-            # treat it as timed out and remove it from pending so we don't hang forever
             if elapsed >= RESEARCH_CAP:
                 for fut, label in list(pending.items()):
-                    if label != "__docs__" and not fut.done():
-                        title_stuck = label
+                    if not fut.done():
                         del pending[fut]
-                        game_results[title_stuck] = (
-                            f"[Web search exceeded {RESEARCH_CAP}s wall-clock limit for "
-                            f"'{title_stuck}' — using Claude's training knowledge instead.]"
-                        )
-                        yield ("log",
-                            f"⚠️ <b>Web search timed out for <i>{title_stuck}</i></b> — "
-                            f"exceeded {RESEARCH_CAP}s hard limit<br>"
-                            "<span class='log-detail'>Moving on with training knowledge.</span>")
-                remaining_games = [l for l in pending.values() if l != "__docs__"]
-                if not remaining_games:
-                    research_done = True
-                    if game_results:
-                        parts = []
-                        for t, r in game_results.items():
-                            parts.append("=== RESEARCH: " + t + " ===\n" + r)
-                        research_text = "\n\n".join(parts)
-                    yield ("step_done", "research")
+                        if label == "__research__":
+                            yield ("log",
+                                f"⚠️ <b>Web research timed out after {RESEARCH_CAP}s</b> — "
+                                "using model knowledge instead.")
 
             for fut, label in resolved:
                 del pending[fut]
                 if label == "__docs__":
-                    docs_done     = True
                     combined_docs = fut.result()
-                    n_files = len(uploaded_files)
+                    n_files = len(uploaded_files or [])
                     n_chars = len(combined_docs)
-                    # Build per-file breakdown
                     _file_detail = "".join(
                         f"<br>&nbsp;&nbsp;· <b>{name}</b>: {chars:,} chars"
                         for name, chars in _file_stats
@@ -2558,8 +2457,8 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                     _trimmed = n_chars >= _MAX_DOC_CHARS
                     yield ("log", (
                         "✅ <b>Documents extracted</b> — {} file{}, {:,} chars total{}{}<br>"
-                        "<span class='log-detail'>Text pulled from your uploads. "
-                        "This content is the primary source of facts about your internal game.</span>"
+                        "<span class='log-detail'>Text pulled from your uploads; "
+                        "primary source of facts for the presentation.</span>"
                     ).format(
                         n_files, "s" if n_files != 1 else "",
                         n_chars,
@@ -2567,84 +2466,50 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                         _file_detail,
                     ))
                     yield ("step_done", "extract")
-                else:
-                    # label is the game title string
-                    res = fut.result()
-                    game_results[label] = res
-                    is_error    = "[Web search error" in res
-                    is_timeout  = "timed out after" in res
-                    is_fallback = any(x in res for x in (
-                        "[Web search disabled", "[No reference", "[No web results",
-                        "timed out after", "[No results"
-                    ))
-                    if is_error and not is_timeout:
-                        yield ("log",
-                            f"⚠️ <b>Web research error for <i>{label}</i></b><br>"
-                            "<span class='log-detail'>Will use Claude's training knowledge instead.</span>")
-                    elif is_fallback:
-                        yield ("log",
-                            f"⚠️ <b>Web search timed out for <i>{label}</i></b> — "
-                            "falling back to model training knowledge<br>"
-                            "<span class='log-detail'>Claude has extensive knowledge of most "
-                            "released titles. The analysis will still be data-rich.</span>")
+                else:  # __research__
+                    result = fut.result()
+                    if isinstance(result, tuple):
+                        research_text, sources = result
                     else:
-                        word_count = len(res.split())
+                        research_text = result
+                        sources = []
+                    is_fallback = any(x in research_text for x in (
+                        "[Web search disabled", "[No web research", "timed out",
+                    ))
+                    if is_fallback:
                         yield ("log",
-                            f"✅ <b>Web research complete — <i>{label}</i></b> "
-                            f"— ~{word_count} words<br>"
-                            "<span class='log-detail'>Review scores, sales data, mechanics, "
-                            "and market context compiled.</span>")
-                    # Mark research step done once all game futures resolved
-                    remaining_games = [l for l in pending.values() if l != "__docs__"]
-                    if not remaining_games:
-                        research_done = True
-                        # Build combined research text
-                        if game_results:
-                            parts = []
-                            for t, r in game_results.items():
-                                parts.append("=== RESEARCH: " + t + " ===\n" + r)
-                            research_text = "\n\n".join(parts)
-                        yield ("step_done", "research")
+                            "⚠️ <b>Web research unavailable</b> — "
+                            "using Claude's training knowledge.<br>"
+                            "<span class='log-detail'>The presentation will still be data-rich "
+                            "from your documents and model knowledge.</span>")
+                    else:
+                        word_count = len(research_text.split())
+                        yield ("log",
+                            f"✅ <b>Web research complete</b> — ~{word_count} words<br>"
+                            "<span class='log-detail'>Research compiled for the analysis.</span>")
+                        if sources:
+                            yield ("sources", sources)
+                    yield ("step_done", "research")
 
             if pending:
                 time.sleep(TICK)
                 elapsed += TICK
-                still_doing = []
-                if not docs_done:
-                    still_doing.append("extracting documents")
-                pending_games = [l for l in pending.values() if l != "__docs__"]
-                if pending_games:
-                    still_doing.append(
-                        "searching web for <i>" + ", ".join(pending_games) +
-                        f"</i> ({elapsed}s elapsed)"
-                    )
-                if still_doing:
-                    yield ("spinner",
-                        "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
-                        "<span class='log-detail'>Web search has a 90s wall-clock deadline — "
-                        "if it times out the pipeline falls back to training knowledge automatically."
-                        "</span>")
+                yield ("spinner",
+                    f"⏳ <b>Still working…</b> {elapsed}s elapsed")
 
 
     # ── STAGE 3: streaming analysis ───────────────────────────────────────────
 
     # Estimate input token count roughly (1 token ≈ 4 chars)
-    prompt_chars = len(combined_docs) + len(research_text) + len(business_question) + 800
+    prompt_chars = len(combined_docs) + len(research_text) + len(question) + 800
     est_input_tokens = prompt_chars // 4
     yield ("spinner", (
         "🤖 <b>Stage 3 of 4 — Claude is writing your presentation</b><br>"
         "<span class='log-detail'>Sending ~{:,} input tokens to {}. Claude will read all your "
-        "document content, cross-reference the research on <i>{}</i>, interpret your business "
-        "question, and produce a structured {}-slide JSON outline with titles, bullet points, "
-        "comparison tables, stat callouts, and speaker notes. "
+        "document content, research, and business question, then produce a structured {}-slide "
+        "JSON outline with titles, bullet points, comparison tables, stat callouts, and speaker notes. "
         "You will see progress updates as each section is written.</span>"
-    ).format(est_input_tokens, model, game_title_display or "the reference game", slide_count))
-
-    theme_desc = {
-        "SEGA Blue — Corporate Executive": "Professional SEGA corporate blue (#0055AA), boardroom-ready.",
-        "SEGA Dark — Game Reveal Style":   "Dark dramatic (#040A1C) with electric blue accents.",
-        "SEGA Sonic — High Energy":        "Vibrant SEGA blue with gold accents, high energy.",
-    }.get(theme_preset, "SEGA corporate blue")
+    ).format(est_input_tokens, model, slide_count))
 
     # ── DATA FILES: extract full data for chart context ──────────────────────
     # Send the complete dataset (all rows, all sheets) up to a token-safe cap.
@@ -2703,65 +2568,21 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 f"{len(data_summary):,} characters of exact data sent to Claude for chart generation"
             ))
 
-    # analysis_prompt defined unconditionally so it exists whether or not data_files
-    analysis_prompt = f"""You are a senior game industry analyst at SEGA.
-Analyse the following and produce a JSON object for a {slide_count}-slide executive presentation.
-
-## INTERNAL GAME DOCUMENTS:
-{combined_docs}
-
-## REFERENCE GAME RESEARCH — {game_title_display}:
-{research_text}
-
-## BUSINESS QUESTION:
-{business_question}
-
-## AUDIENCE: {audience}
-
-## UPLOADED DATA FOR CHARTS:
-{data_summary if data_summary else "(no data files uploaded)"}
-
-Output a single JSON object. Schema:
-{{
-  "title":"...", "subtitle":"...",
-  "theme":{{"primary":"hex (dark-to-mid blue for SEGA branding, e.g. 0055AA)","accent":"hex (vivid cyan or teal, e.g. 00AADD)"}},
-  "slides":[
-    {{
-      "type":"title|section|comparison|bullets|stats|recommendation|closing|chart",
-      "title":"...","subtitle":"...","body":"...",
-      "bullets":["..."],
-      "stats":[{{"label":"...","value":"...","note":"..."}}],
-      "comparison":{{
-        "left_title":"Internal Game","right_title":"<Game Title>",
-        "rows":[{{"label":"...","left":"...","right":"...","delta":"positive|negative|neutral"}}]
-      }},
-      "chart":{{
-        "chart_type":"bar|line|scatter|pie|horizontal_bar",
-        "title":"...","x_label":"...","y_label":"...",
-        "categories":["..."],
-        "series":[{{"label":"...","values":[0.0]}}],
-        "colors":["hex"]
-      }},
-      "sources":["Source name / URL — used for facts on this slide"],
-      "speaker_notes":"..."
-    }}
-  ]
-}}
-
-Rules:
-- Use REAL data from documents and research — no placeholders
-- Be specific and data-driven for {audience}
-- theme.primary and theme.accent must be dark-to-mid vivid hex colours (6 digits, no #).
-  Never use white, near-white, or light pastels (no values above DDDDDD).
-  Good: "0055AA", "003380", "00AADD". Bad: "FFFFFF", "F0F0F0", "C8D8EE".
-- Keep speaker_notes to 1-2 sentences maximum — they are brief presenter cues, not essays
-- Bullets: max 6 per slide, each under 15 words
-- Comparison rows: max 8 per slide
-- If multiple reference games are provided, you may produce one comparison slide per game, or a multi-column comparison slide covering all of them. Use the game title(s) as the right_title in comparison slides.
-- Use "chart" type whenever data allows — populate chart.series with real numeric values from documents or research. Charts are strongly preferred over bullet lists for quantitative information.
-- DO NOT mention AI, machine learning, or related technology unless the topic or business question explicitly concerns it. Focus solely on the subject matter requested.
-- Every slide must include a "sources" field: a list of strings citing where each fact/stat came from (e.g. "Newzoo Global Games Report 2025", "Company earnings call Q4 2025"). Use empty list [] only if a slide is purely structural (title, section divider).
-- Return ONLY valid JSON — no markdown fences, no explanation"""
+    # Build the analysis prompt via the generic helper
+    _theme_dict = theme if isinstance(theme, dict) else {"primary": "1A3A6B", "accent": "0099CC"}
+    analysis_prompt = _build_analysis_prompt(
+        topic=topic,
+        purpose=purpose,
+        industry=industry,
+        audience=audience,
+        question=question,
+        slide_count=slide_count,
+        doc_text=combined_docs,
+        research_text=research_text,
+        data_summary=data_summary,
+        theme=_theme_dict,
+        sources=sources if sources else None,
+    )
 
     raw_chunks   = []
     char_count   = 0
@@ -2791,7 +2612,7 @@ Rules:
             with client.messages.stream(
                 model=model,
                 max_tokens=8000,
-                system="You are a precise game industry analyst. Return valid JSON only.",
+                system="You are a precise presentation analyst. Return valid JSON only.",
                 messages=[{"role": "user", "content": analysis_prompt}],
             ) as stream:
                 for text_chunk in stream.text_stream:
@@ -2995,6 +2816,8 @@ Rules:
         return
 
     yield ("step_done", "generate")
+    # Post-process: embed source attributions and any fetched images
+    pptx_bytes_out = _postprocess_pptx(pptx_bytes_out, slide_data.get("slides", []))
     yield ("log", (
         "🎉 <b>All done!</b> — PPTX is {:.0f} KB across {} slides<br>"
         "<span class='log-detail'>Your presentation is ready to download. "
@@ -3043,15 +2866,12 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 
     def _fetch():
         try:
-            client = _make_search_client()
-            if not client.api_key:
-                return "[Web search skipped: ANTHROPIC_API_KEY not set in secrets]", []
+            client = _make_anthropic_client()
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="us.anthropic.claude-haiku-4-5-20251001",
                 max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
-                timeout=80.0,
             )
 
             full_text = "\n".join(
@@ -3115,12 +2935,11 @@ def _fetch_image_for_query(query: str) -> bytes | None:
     try:
         import urllib.request, re as _re
 
-        client = _make_search_client()
+        client = _make_anthropic_client()
 
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="us.anthropic.claude-haiku-4-5-20251001",
             max_tokens=400,
-            timeout=30.0,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
                 "role": "user",
@@ -3773,6 +3592,15 @@ def _clear_project():
 # PDF → PPTX ENGINE (ported from pdf_to_pptx.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
+"""
+pdf_to_pptx.py — Convert PDF slides to fully editable PPTX.
+
+Pipeline per page:
+  1. Rasterise via PyMuPDF (no system deps)
+  2. Detect if page is a full-page raster (NotebookLM/Canva/etc export)
+  3. Send page image to Claude vision → JSON element spec
+  4. Reconstruct as native pptx shapes/text/tables + image crops
+"""
 
 SLIDE_W_IN = 13.33
 SLIDE_H_IN = 7.5
@@ -3873,7 +3701,7 @@ def _place_image_bytes(slide, img_bytes: bytes, x, y, w, h) -> None:
 
 def _extract_slide_json(image_b64: str, model: str) -> dict:
     import anthropic
-    client = _make_anthropic_client()
+    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
     msg = client.messages.create(
         model=model, max_tokens=4096,
         messages=[{"role":"user","content":[
@@ -4062,228 +3890,6 @@ def pdf_to_editable_pptx(
 
 # Alias for creator tab
 _pdf_to_pptx = pdf_to_editable_pptx
-
-_creator_ok = True  # all creator functions are local in slide_suite.py
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTH — OTP via AWS SES + signed URL token
-# Restricted to @segaamerica.com addresses only.
-# ─────────────────────────────────────────────────────────────────────────────
-
-ALLOWED_DOMAIN     = "@segaamerica.com"
-OTP_EXPIRY_SECS    = 600   # 10 minutes
-TOKEN_EXPIRY_DAYS  = 1     # signed URL token survives 1 day
-
-
-def _send_otp(email: str, code: str) -> bool:
-    """Send OTP via AWS SES. Returns True on success."""
-    try:
-        import boto3
-        ses = boto3.client(
-            "ses",
-            region_name=st.secrets.get("AWS_SES_REGION", "us-east-1"),
-            aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY_ID", ""),
-            aws_secret_access_key=st.secrets.get("AWS_SECRET_ACCESS_KEY", ""),
-        )
-        ses.send_email(
-            Source=st.secrets.get("EMAIL_FROM", "noreply@segaamerica.com"),
-            Destination={"ToAddresses": [email]},
-            Message={
-                "Subject": {"Data": "SEGA Slide Suite \u2014 Your verification code", "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {
-                        "Data": f"Your SEGA Slide Suite verification code is: {code}\n\nExpires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.",
-                        "Charset": "UTF-8",
-                    },
-                    "Html": {
-                        "Data": f"""
-                        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
-                                    background:#040A1C;border:1px solid #0033AA;border-top:3px solid #0055AA;
-                                    border-radius:10px;overflow:hidden;">
-                          <div style="padding:28px 32px 16px;border-bottom:1px solid rgba(0,102,204,0.3);">
-                            <div style="font-family:'Arial Black',Arial,sans-serif;font-size:26px;
-                                        font-weight:900;letter-spacing:.15em;color:#FFFFFF;">SEGA</div>
-                            <div style="font-size:11px;letter-spacing:.3em;color:#00CCFF;
-                                        text-transform:uppercase;margin-top:2px;">Slide Suite</div>
-                          </div>
-                          <div style="padding:28px 32px 32px;">
-                            <div style="font-size:14px;color:#D0E4FF;margin-bottom:20px;">
-                              Your verification code is:
-                            </div>
-                            <div style="font-size:44px;font-weight:900;letter-spacing:.2em;color:#FFFFFF;
-                                        background:rgba(0,85,170,0.35);border:1px solid rgba(0,204,255,0.3);
-                                        border-radius:8px;padding:16px 24px;display:inline-block;
-                                        margin-bottom:24px;font-family:'Arial Black',Arial,sans-serif;">
-                              {code}
-                            </div>
-                            <div style="font-size:12px;color:#8899BB;line-height:1.6;">
-                              Expires in 10 minutes.<br>
-                              If you didn't request this, you can safely ignore this email.
-                            </div>
-                          </div>
-                        </div>""",
-                        "Charset": "UTF-8",
-                    },
-                },
-            },
-        )
-        return True
-    except Exception as e:
-        st.error(f"Failed to send email: {e}")
-        return False
-
-
-def _make_token(email: str) -> str:
-    """Create a signed URL token valid for TOKEN_EXPIRY_DAYS."""
-    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
-    expiry  = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
-    payload = f"{email}|{expiry}"
-    sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
-
-
-def _verify_token(token: str) -> str | None:
-    """Verify token. Returns email if valid and unexpired, else None."""
-    try:
-        secret   = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
-        decoded  = base64.urlsafe_b64decode(token.encode()).decode()
-        email, expiry_str, sig = decoded.rsplit("|", 2)
-        payload  = f"{email}|{expiry_str}"
-        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        if int(time.time()) > int(expiry_str):
-            return None
-        return email
-    except Exception:
-        return None
-
-
-# ── Read token from URL on every page load ────────────────────────────────────
-_url_token   = st.query_params.get("t", "")
-_token_email = _verify_token(_url_token) if _url_token else None
-
-# ── Session state init ────────────────────────────────────────────────────────
-for _k, _v in [
-    ("auth_verified", False), ("auth_email", ""),
-    ("auth_token",    ""),
-    ("otp_code",      ""), ("otp_email", ""), ("otp_expiry", 0),
-    ("otp_sent",      False), ("otp_attempts", 0),
-]:
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-# If valid token in URL, auto-authenticate
-if _token_email and not st.session_state.auth_verified:
-    st.session_state.auth_verified = True
-    st.session_state.auth_email    = _token_email
-    st.session_state.auth_token    = _url_token
-
-# ── Login gate ────────────────────────────────────────────────────────────────
-if not st.session_state.auth_verified:
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@400;600&display=swap');
-    .login-outer{
-        min-height:80vh;display:flex;align-items:center;justify-content:center;
-        background:linear-gradient(135deg,#040A1C 0%,#0D1B3E 50%,#040A1C 100%);
-    }
-    .login-wrap{
-        max-width:420px;width:100%;padding:2.5rem 2rem;
-        background:rgba(0,30,80,0.6);
-        border:1px solid rgba(0,102,204,0.45);
-        border-top:3px solid #0055AA;
-        border-radius:12px;
-        backdrop-filter:blur(12px);
-        box-shadow:0 0 40px rgba(0,85,170,0.25);
-    }
-    .login-logo{
-        font-family:'Orbitron',monospace;font-size:2.4rem;font-weight:900;
-        letter-spacing:.15em;color:#FFFFFF;
-        text-shadow:0 0 20px #0055AA,0 0 40px #00CCFF;
-        margin-bottom:.2rem;text-align:center;
-    }
-    .login-sub{
-        font-family:'Orbitron',monospace;font-size:.65rem;font-weight:700;
-        letter-spacing:.35em;color:#00CCFF;text-transform:uppercase;
-        text-align:center;margin-bottom:.35rem;
-    }
-    .login-divider{ border:none;border-top:1px solid rgba(0,102,204,0.35);margin:1.2rem 0; }
-    .login-title{
-        font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:600;
-        color:#D0E4FF;text-align:center;margin-bottom:1.5rem;letter-spacing:.04em;
-    }
-    </style>
-    <div class="login-outer">
-      <div class="login-wrap">
-        <div class="login-logo">SEGA</div>
-        <div class="login-sub">Slide Suite</div>
-        <hr class="login-divider"/>
-        <div class="login-title">Sign in with your SEGA America email</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if not st.session_state.otp_sent:
-        with st.form("login_form"):
-            _email_input = st.text_input("Email address", placeholder="you@segaamerica.com")
-            _send_btn    = st.form_submit_button("Send verification code", use_container_width=True)
-
-        if _send_btn and _email_input:
-            if not _email_input.strip().lower().endswith(ALLOWED_DOMAIN.lower()):
-                st.error(f"Only {ALLOWED_DOMAIN} addresses are allowed.")
-            else:
-                _code = str(abs(hash(f"{_email_input}{time.time()}")) % 900000 + 100000)
-                if _send_otp(_email_input.strip().lower(), _code):
-                    st.session_state.otp_code     = _code
-                    st.session_state.otp_email    = _email_input.strip().lower()
-                    st.session_state.otp_expiry   = time.time() + OTP_EXPIRY_SECS
-                    st.session_state.otp_sent     = True
-                    st.session_state.otp_attempts = 0
-                    st.rerun()
-    else:
-        st.info(f"Code sent to **{st.session_state.otp_email}** \u2014 check your inbox.")
-        with st.form("otp_form"):
-            _code_input = st.text_input("Enter 6-digit code", max_chars=6, key="auth_code_input")
-            _verify_btn = st.form_submit_button("Verify code", use_container_width=True, type="primary")
-
-        if _verify_btn and _code_input:
-            if st.session_state.otp_attempts >= 5:
-                st.error("Too many attempts. Please request a new code.")
-                st.session_state.otp_sent = False
-            elif time.time() > st.session_state.otp_expiry:
-                st.error("Code expired. Please request a new one.")
-                st.session_state.otp_sent = False
-            elif _code_input.strip() != st.session_state.otp_code:
-                st.session_state.otp_attempts += 1
-                _rem = 5 - st.session_state.otp_attempts
-                st.error(f"Incorrect code. {_rem} attempt{'s' if _rem != 1 else ''} remaining.")
-            else:
-                st.session_state.auth_verified = True
-                st.session_state.auth_email    = st.session_state.otp_email
-                st.session_state.otp_code      = ""
-                _token = _make_token(st.session_state.auth_email)
-                st.session_state.auth_token    = _token
-                st.query_params["t"] = _token
-                st.rerun()
-
-        _back_col, _ = st.columns([1, 1])
-        with _back_col:
-            if st.button("\u2190 Use a different email", key="auth_back"):
-                st.session_state.otp_sent = False
-                st.session_state.otp_code = ""
-                st.rerun()
-
-    st.markdown(
-        f"<div style='text-align:center;font-size:.72rem;color:#6080A8;margin-top:1rem'>"
-        f"Restricted to {ALLOWED_DOMAIN} addresses \u00b7 Codes expire after 10 minutes</div>",
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN APP (authenticated users only beyond this point)
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SLIDE SUITE UI (ported from pptx_verifier_new.py)
@@ -4505,28 +4111,22 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
     """
     Parse a markdown document into a slide outline list.
     Convention:
-      # H1        → deck title (skipped as a slide, used as topic)
-      ## H2       → slide title
-      ### H3      → sub-section within a slide (treated as a bold bullet)
-      - / * / +   → bullet points
-      > text      → takeaway / callout block
-      **text**    → kept as-is (bold)
-      plain text  → body paragraph (first plain line per slide = subtitle)
-      ---         → explicit slide break (optional)
-      ::chart::   → chart block (YAML-style, ended by ::end::)
-                    fields: type, title, source, categories (CSV), series (name: v,v,v)
-    Returns list of dicts: {title, subtitle, bullets, takeaway, notes, chart}
+      # H1      → deck title (skipped as a slide, used as topic)
+      ## H2     → slide title
+      ### H3    → sub-section within a slide (treated as a bold bullet)
+      - / * / + → bullet points
+      > text    → takeaway / callout block
+      **text**  → kept as-is (bold)
+      plain     → body paragraph
+      ---       → explicit slide break (optional)
+    Returns list of dicts: {title, bullets, takeaway, notes}
     """
     slides = []
     current: dict | None = None
 
     def flush():
-        if current and (current["title"] or current["bullets"] or current.get("chart")):
+        if current and (current["title"] or current["bullets"]):
             slides.append(dict(current))
-
-    def _new_slide(title=""):
-        return {"title": title, "subtitle": "", "bullets": [],
-                "takeaway": "", "notes": "", "chart": None}
 
     lines = md_text.splitlines()
     i = 0
@@ -4537,7 +4137,7 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # Explicit slide break
         if stripped in ("---", "***", "___"):
             flush()
-            current = _new_slide()
+            current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
             i += 1; continue
 
         # H1 — deck title, skip as a slide
@@ -4547,13 +4147,13 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # H2 — new slide
         if stripped.startswith("## "):
             flush()
-            current = _new_slide(stripped[3:].strip())
+            current = {"title": stripped[3:].strip(), "bullets": [], "takeaway": "", "notes": ""}
             i += 1; continue
 
         # H3 — sub-heading within slide → bold bullet
         if stripped.startswith("### "):
             if current is None:
-                current = _new_slide(stripped[4:].strip())
+                current = {"title": stripped[4:].strip(), "bullets": [], "takeaway": "", "notes": ""}
             else:
                 current["bullets"].append(f"**{stripped[4:].strip()}**")
             i += 1; continue
@@ -4561,64 +4161,21 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
         # Blockquote → takeaway
         if stripped.startswith("> "):
             if current is None:
-                current = _new_slide()
+                current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
             current["takeaway"] = stripped[2:].strip()
             i += 1; continue
-
-        # ::chart:: block — parse until ::end::
-        if stripped == "::chart::":
-            if current is None:
-                current = _new_slide()
-            chart = {"chart_type": "bar", "title": "", "source": "",
-                     "categories": [], "series": [], "colors": []}
-            i += 1
-            current_series_name = None
-            while i < len(lines) and lines[i].strip() != "::end::":
-                cl = lines[i]
-                cs = cl.strip()
-                if cs.startswith("type:"):
-                    chart["chart_type"] = cs.split(":", 1)[1].strip()
-                elif cs.startswith("title:"):
-                    chart["title"] = cs.split(":", 1)[1].strip()
-                elif cs.startswith("source:"):
-                    chart["source"] = cs.split(":", 1)[1].strip()
-                    if chart["source"] and chart["source"] not in (current.get("bullets") or []):
-                        pass  # stored in chart, used for sources field
-                elif cs.startswith("categories:"):
-                    chart["categories"] = [c.strip() for c in cs.split(":", 1)[1].split(",")]
-                elif cs.startswith("series:"):
-                    pass  # section header, series lines follow
-                elif ":" in cs and not cs.startswith("#"):
-                    # "  SeriesName: v1, v2, v3"
-                    name, vals_str = cs.split(":", 1)
-                    try:
-                        vals = [float(v.strip().replace(",","")) for v in vals_str.split(",") if v.strip()]
-                        chart["series"].append({"label": name.strip(), "values": vals})
-                    except ValueError:
-                        pass
-                i += 1
-            if i < len(lines):
-                i += 1  # skip ::end::
-            current["chart"] = chart
-            # Also add chart source to bullets if present
-            if chart.get("source"):
-                current["bullets"].append(f"Source: {chart['source']}")
-            continue
 
         # Bullet
         if re.match(r"^[-*+] ", stripped) or re.match(r"^\d+\. ", stripped):
             if current is None:
-                current = _new_slide()
+                current = {"title": "", "bullets": [], "takeaway": "", "notes": ""}
             text = re.sub(r"^[-*+] |^\d+\. ", "", stripped)
             current["bullets"].append(text)
             i += 1; continue
 
-        # Non-empty plain line — first one = subtitle, rest = bullets
+        # Non-empty plain line → body paragraph as bullet
         if stripped and current is not None:
-            if not current["subtitle"]:
-                current["subtitle"] = stripped
-            else:
-                current["bullets"].append(stripped)
+            current["bullets"].append(stripped)
 
         i += 1
 
@@ -4627,39 +4184,22 @@ def parse_md_to_outline(md_text: str) -> list[dict]:
 
 
 def outline_to_slide_json(outline: list[dict], topic: str = "") -> dict:
-    """Convert parsed outline into the slide_json format used by generate_pptx."""
+    """Convert parsed outline into the slide_json format used by pptx_creator."""
     slides_out = []
     for idx, sl in enumerate(outline):
-        bullets  = list(sl.get("bullets", []))
+        bullets = sl.get("bullets", [])
         takeaway = sl.get("takeaway", "")
         if takeaway:
             bullets = bullets + [f"**Key Takeaway:** {takeaway}"]
-
-        chart = sl.get("chart")
-        slide_type = "chart" if chart else "bullets"
-
-        entry: dict = {
+        slides_out.append({
             "slide_number": idx + 1,
-            "type":         slide_type,
-            "title":        sl.get("title", f"Slide {idx + 1}"),
-            "subtitle":     sl.get("subtitle", ""),
-            "bullets":      bullets,
-            "notes":        sl.get("notes", ""),
-            "sources":      [chart["source"]] if chart and chart.get("source") else [],
-        }
-        if chart:
-            entry["chart"] = {
-                "chart_type": chart.get("chart_type", "bar"),
-                "title":      chart.get("title", ""),
-                "categories": chart.get("categories", []),
-                "series":     chart.get("series", []),
-                "colors":     chart.get("colors", []),
-            }
-        slides_out.append(entry)
-
+            "title": sl.get("title", f"Slide {idx + 1}"),
+            "bullets": bullets,
+            "notes": sl.get("notes", ""),
+        })
     return {
-        "topic":        topic,
-        "slides":       slides_out,
+        "topic": topic,
+        "slides": slides_out,
         "total_slides": len(slides_out),
     }
 
@@ -4709,8 +4249,7 @@ End with **Overall Deck Score** (0–100) and top 3 highest-impact changes."""
 
 
 def analyze_slides_with_claude(slides, filename):
-    import anthropic
-    client = _make_anthropic_client()
+    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
     parts = []
     for s in slides:
         p = [f"## Slide {s['slide_num']}", f"**Title:** {s['title'] or '(no title)'}"]
@@ -4744,8 +4283,7 @@ def augment_outline_with_claude(outline: list[dict], topic: str, purpose: str) -
     Optionally call Claude to enrich each slide's bullets and add takeaway blocks
     before generating the PPTX.
     """
-    import anthropic
-    client = _make_anthropic_client()
+    client = anthropic.AnthropicBedrock(aws_region="us-east-2")
     import json as _json
     prompt = (
         f"You are a presentation expert. The user has provided a markdown outline for a presentation.\n"
@@ -4881,72 +4419,6 @@ def _render_slide_preview(outline: list[dict], editable: bool = False, ns: str =
 
 
 # ═══════════════════════════════════════════════════════════════
-# PPTX VISUAL PREVIEW — LibreOffice → PDF → fitz rasterization
-# ═══════════════════════════════════════════════════════════════
-
-def _pptx_to_slide_images(pptx_bytes: bytes, dpi: int = 120) -> list[bytes]:
-    """
-    Convert PPTX bytes → list of PNG bytes (one per slide).
-    Uses LibreOffice headless for PPTX→PDF, then fitz for rasterization.
-    Returns [] if conversion fails.
-    """
-    import subprocess, tempfile, os
-    try:
-        import fitz as _fitz
-    except ImportError:
-        return []
-
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            pptx_path = os.path.join(tmp, "deck.pptx")
-            pdf_path  = os.path.join(tmp, "deck.pdf")
-
-            with open(pptx_path, "wb") as f:
-                f.write(pptx_bytes)
-
-            r = subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf",
-                 "--outdir", tmp, pptx_path],
-                capture_output=True, timeout=60
-            )
-            if not os.path.exists(pdf_path):
-                return []
-
-            scale = dpi / 72
-            mat   = _fitz.Matrix(scale, scale)
-            doc   = _fitz.open(pdf_path)
-            pages = [doc[i].get_pixmap(matrix=mat).tobytes("png")
-                     for i in range(len(doc))]
-            doc.close()
-            return pages
-    except Exception:
-        return []
-
-
-def _render_pptx_visual_preview(pptx_bytes: bytes) -> None:
-    """Render a visual thumbnail grid of all slides in the PPTX."""
-    with st.spinner("Rendering slide thumbnails…"):
-        pages = _pptx_to_slide_images(pptx_bytes, dpi=120)
-
-    if not pages:
-        st.info("Visual preview unavailable — LibreOffice or PyMuPDF not accessible on this host.")
-        return
-
-    st.markdown(
-        f"<div style='font-size:.75rem;color:#64748b;margin-bottom:.5rem'>"
-        f"{len(pages)} slide{'s' if len(pages)!=1 else ''}</div>",
-        unsafe_allow_html=True)
-
-    cols_per_row = 3
-    for row_start in range(0, len(pages), cols_per_row):
-        row_pages = pages[row_start:row_start + cols_per_row]
-        cols = st.columns(len(row_pages), gap="small")
-        for col, (png, idx) in zip(cols, [(p, row_start + i) for i, p in enumerate(row_pages)]):
-            with col:
-                st.image(png, caption=f"Slide {idx + 1}", use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════
 # MAIN APP — HEADER
 # ═══════════════════════════════════════════════════════════════
 
@@ -4961,9 +4433,9 @@ st.divider()
 # ═══════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════
-t_md, t_verify, t_create, t_pdf, t_gallery, t_patterns = st.tabs([
-    "📝 Markdown → PPTX",
+t_verify, t_md, t_create, t_pdf, t_gallery, t_patterns = st.tabs([
     "🔍 Verify a Deck",
+    "📝 Markdown → PPTX",
     "🎮 Create PPTX",
     "📄 PDF → PPTX",
     "📚 Reference Gallery",
@@ -5189,12 +4661,6 @@ with t_md:
 
         st.divider()
 
-        # ── Slide preview ─────────────────────────────────────
-        st.markdown("### 🗂 Slide Preview")
-        st.caption("Review your slides before generating. Titles and bullets are editable inline.")
-        outline = _render_slide_preview(outline, editable=True, ns="md_prev")
-        st.divider()
-
         # ── Claude augmentation ───────────────────────────────
         if md_augment and not st.session_state.get("md_augmented") and _creator_ok:
             if st.button("✨ Augment with Claude first", key="md_augment_btn", use_container_width=True):
@@ -5214,65 +4680,70 @@ with t_md:
             if st.button(f"⚡ Generate PPTX  ({n} slides · {_est_time(n)})",
                          use_container_width=True, type="primary", key="md_gen_btn"):
 
-                # Convert outline to slide_json and inject into session_state
-                # so _render_plan_modal can pick it up, then immediately trigger build
-                slide_json = outline_to_slide_json(
-                    st.session_state["md_outline"], topic=topic)
-                st.session_state["plan_slide_data"]  = slide_json
-                st.session_state["plan_mode_active"] = True
-                st.session_state["proj_topic"]       = topic
-                st.session_state["active_project"]   = topic[:40]
-
                 _tpl_bytes = _md_tpl_bytes if _creator_ok else None
-                _md_logs   = []
-                _log_ph    = st.empty()
-                _prog_ph   = st.empty()
 
-                try:
-                    for _ev in _run_pipeline(
-                        model="us.anthropic.claude-sonnet-4-6",
-                        uploaded_files=[],
-                        game_title=topic,
-                        business_question="",
-                        audience="General audience",
-                        theme_preset=_md_theme_nm,
-                        web_search_en=False,
-                        slide_count=n,
-                        template_bytes=_tpl_bytes,
-                        plan_mode=False,
-                    ):
-                        _et = _ev[0]
-                        if _et in ("log", "spinner"):
-                            if _et == "spinner":
-                                if _md_logs and _md_logs[-1][0] == "spinner":
-                                    _md_logs[-1] = ("log", _md_logs[-1][1])
-                                _md_logs.append(("spinner", _ev[1]))
-                            else:
-                                if _md_logs and _md_logs[-1][0] == "spinner":
-                                    _md_logs[-1] = ("log", _md_logs[-1][1])
-                                _md_logs.append(("log", _ev[1]))
-                            _log_ph.markdown(_render_log(_md_logs), unsafe_allow_html=True)
-                        elif _et == "sources":
-                            if _md_sources_slide:
-                                st.session_state["research_sources"] = _ev[1]
-                        elif _et == "pptx_bytes_out":
-                            _slug = re.sub(r"[^a-zA-Z0-9]+", "_", topic)[:50]
-                            st.session_state["md_pptx_bytes"]    = _ev[1]
-                            st.session_state["md_pptx_filename"] = f"{_slug}.pptx"
-                            # Harvest per-slide sources from plan_slide_data
-                            _ssrc = {}
-                            for _sl in (st.session_state.get("plan_slide_data", {}).get("slides") or []):
-                                _snum = str(_sl.get("slide_number", _sl.get("slide_num", "")))
-                                _slsrc = _sl.get("sources", [])
-                                if _snum and _slsrc:
-                                    _ssrc[_snum] = _slsrc
-                            if _ssrc:
-                                st.session_state["slide_sources"] = _ssrc
-                        elif _et == "error":
-                            st.error(_ev[1], icon="🚨"); break
-                except Exception as _mex:
-                    st.error(f"Generation failed: {_mex}")
-                    import traceback; st.code(traceback.format_exc())
+                with st.spinner(f"Building PPTX from your outline ({n} slides)…"):
+                    try:
+                        outline = st.session_state["md_outline"]
+
+                        # ── Convert parsed outline directly to generate_pptx() format.
+                        #    No Claude call needed — the markdown is already structured. ──
+                        gen_slides = []
+
+                        # Title slide
+                        gen_slides.append({
+                            "type":     "title",
+                            "title":    topic,
+                            "subtitle": "",
+                            "body":     "",
+                        })
+
+                        for sl in outline:
+                            raw_bullets = sl.get("bullets", [])
+                            takeaway    = sl.get("takeaway", "")
+
+                            # Strip any takeaway line that was merged into bullets
+                            clean_bullets = [
+                                b for b in raw_bullets
+                                if not b.startswith("**Key Takeaway:")
+                            ][:6]
+
+                            stype = "section" if (not clean_bullets and not takeaway) else "bullets"
+
+                            gen_slides.append({
+                                "type":          stype,
+                                "title":         sl.get("title", ""),
+                                "bullets":       clean_bullets,
+                                "body":          takeaway,
+                                "speaker_notes": sl.get("notes", ""),
+                            })
+
+                        # Closing slide
+                        gen_slides.append({
+                            "type":     "closing",
+                            "title":    "Thank You",
+                            "subtitle": topic,
+                            "body":     "",
+                        })
+
+                        slide_data = {
+                            "title":  topic,
+                            "theme":  _md_theme,
+                            "slides": gen_slides,
+                        }
+
+                        pptx_out = generate_pptx(slide_data, template_bytes=_tpl_bytes)
+                        _slug    = re.sub(r"[^a-zA-Z0-9]+", "_", topic)
+                        fname    = f"{_slug[:50]}.pptx"
+
+                        st.session_state["md_pptx_bytes"]    = pptx_out
+                        st.session_state["md_pptx_filename"] = fname
+                        st.rerun()
+
+                    except Exception as _mex:
+                        st.error(f"Generation failed: {_mex}")
+                        import traceback
+                        st.code(traceback.format_exc())
 
             if st.session_state.get("md_pptx_bytes"):
                 st.success("✅ Presentation ready!")
@@ -5283,23 +4754,12 @@ with t_md:
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True)
 
-                st.markdown("#### 🖼 Slide Preview")
-                _render_pptx_visual_preview(st.session_state["md_pptx_bytes"])
-
                 # Sources
                 _srcs = st.session_state.get("research_sources", [])
                 if _srcs:
-                    with st.expander(f"🔗 {len(_srcs)} web source(s) used"):
+                    with st.expander(f"🔗 {len(_srcs)} source(s) used"):
                         for _s in _srcs:
                             st.markdown(f"- [{_s.get('title',_s.get('url',''))}]({_s.get('url','')})")
-                _slide_srcs = st.session_state.get("slide_sources", {})
-                if _slide_srcs:
-                    with st.expander(f"📚 Per-slide sources ({sum(len(v) for v in _slide_srcs.values())} citations)"):
-                        for _sn, _ssl in sorted(_slide_srcs.items()):
-                            if _ssl:
-                                st.markdown(f"**Slide {_sn}**")
-                                for _sc in _ssl:
-                                    st.markdown(f"  - {_sc}")
 
                 if st.button("🔄 Start a new outline", key="md_reset"):
                     for _k in ["md_outline","md_topic","md_slide_data","md_augmented",
@@ -5350,374 +4810,369 @@ with t_create:
 
         if not _active:
             st.info("Enter a session name above to get started.")
+            st.stop()
 
-        if _active:
-            st.markdown(
-                f"<div style='font-size:.75rem;color:#4A6A9A;margin-bottom:.5rem'>"
-                f"Session: <b style='color:#D0E4FF'>{_active}</b></div>",
-                unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:.75rem;color:#4A6A9A;margin-bottom:.5rem'>"
+            f"Session: <b style='color:#D0E4FF'>{_active}</b></div>",
+            unsafe_allow_html=True)
 
-            # ── Mode toggle ───────────────────────────────────────
-            _cr_mode = st.radio("Build mode", ["💬 Guided (chat)", "📋 Quick form"],
-                                horizontal=True, key="cr_mode", label_visibility="collapsed")
+        # ── Mode toggle ───────────────────────────────────────
+        _cr_mode = st.radio("Build mode", ["💬 Guided (chat)", "📋 Quick form"],
+                            horizontal=True, key="cr_mode", label_visibility="collapsed")
 
-            # ── Shared options ────────────────────────────────────
-            with st.expander("⚙️ Options", expanded=False):
-                _oc1, _oc2, _oc3 = st.columns(3)
-                with _oc1:
-                    _cr_model  = st.selectbox("Model",
-                        ["us.anthropic.claude-sonnet-4-6","us.anthropic.claude-opus-4-6","us.anthropic.claude-haiku-4-5-20251001"], key="cr_model")
-                    _cr_web    = st.checkbox("Web research",
-                                             value=st.session_state.get("proj_web_research", True), key="cr_web")
-                    st.session_state["proj_web_research"] = _cr_web
-                    _cr_srcs_slide = st.checkbox("Add sources slide", value=True, key="cr_srcs_slide")
-                with _oc2:
-                    _cr_slides   = st.slider("Target slides", 6, 25, 12, key="cr_slides")
-                    _cr_theme_nm = st.selectbox("Theme", list(THEME_PRESETS.keys()), key="cr_theme")
-                    _cr_theme    = THEME_PRESETS[_cr_theme_nm]
-                    st.markdown(
-                        f'<div class="est-time">Estimated time: {_est_time(_cr_slides)}</div>',
-                        unsafe_allow_html=True)
-                with _oc3:
-                    _cr_tpl_up = st.file_uploader("Custom .pptx template", type=["pptx"], key="cr_template")
-                    # Template preview
-                    if _cr_tpl_up and HAS_PPTX:
-                        try:
-                            _cr_tpl_up.seek(0)
-                            _cr_tpl_bytes_raw = _cr_tpl_up.read()
-                            with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as _tf4:
-                                _tf4.write(_cr_tpl_bytes_raw); _tf4_path = _tf4.name
-                            _tprs2 = Presentation(_tf4_path); os.unlink(_tf4_path)
-                            w2 = _tprs2.slide_width.inches; h2 = _tprs2.slide_height.inches
-                            st.markdown(
-                                f'<div class="tpl-preview">📐 {w2:.1f}" × {h2:.1f}" · '
-                                f'{len(_tprs2.slide_layouts)} layouts</div>',
-                                unsafe_allow_html=True)
-                            _cr_tpl_up.seek(0)
-                            st.session_state["saved_template_bytes"] = _cr_tpl_bytes_raw
-                        except Exception: pass
-                    _cr_pipeline = st.session_state.get("pipeline_steps", {})
-                    for _pk, _pl in {"upload":"Docs","extract":"Extract",
-                                      "research":"Research","analyze":"Analyze","generate":"Generate"}.items():
-                        _pd2 = _cr_pipeline.get(_pk, False)
+        # ── Shared options ────────────────────────────────────
+        with st.expander("⚙️ Options", expanded=False):
+            _oc1, _oc2, _oc3 = st.columns(3)
+            with _oc1:
+                _cr_model  = st.selectbox("Model",
+                    ["us.anthropic.claude-sonnet-4-6","us.anthropic.claude-opus-4-6","us.anthropic.claude-haiku-4-5-20251001"], key="cr_model")
+                _cr_web    = st.checkbox("Web research",
+                                         value=st.session_state.get("proj_web_research", True), key="cr_web")
+                st.session_state["proj_web_research"] = _cr_web
+                _cr_srcs_slide = st.checkbox("Add sources slide", value=True, key="cr_srcs_slide")
+            with _oc2:
+                _cr_slides   = st.slider("Target slides", 6, 25, 12, key="cr_slides")
+                _cr_theme_nm = st.selectbox("Theme", list(THEME_PRESETS.keys()), key="cr_theme")
+                _cr_theme    = THEME_PRESETS[_cr_theme_nm]
+                st.markdown(
+                    f'<div class="est-time">Estimated time: {_est_time(_cr_slides)}</div>',
+                    unsafe_allow_html=True)
+            with _oc3:
+                _cr_tpl_up = st.file_uploader("Custom .pptx template", type=["pptx"], key="cr_template")
+                # Template preview
+                if _cr_tpl_up and HAS_PPTX:
+                    try:
+                        _cr_tpl_up.seek(0)
+                        _cr_tpl_bytes_raw = _cr_tpl_up.read()
+                        with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as _tf4:
+                            _tf4.write(_cr_tpl_bytes_raw); _tf4_path = _tf4.name
+                        _tprs2 = Presentation(_tf4_path); os.unlink(_tf4_path)
+                        w2 = _tprs2.slide_width.inches; h2 = _tprs2.slide_height.inches
                         st.markdown(
-                            f'<div class="{"cr-step-done" if _pd2 else "cr-step-pend"}">'
-                            f'{"✓" if _pd2 else "○"} {_pl}</div>', unsafe_allow_html=True)
+                            f'<div class="tpl-preview">📐 {w2:.1f}" × {h2:.1f}" · '
+                            f'{len(_tprs2.slide_layouts)} layouts</div>',
+                            unsafe_allow_html=True)
+                        _cr_tpl_up.seek(0)
+                        st.session_state["saved_template_bytes"] = _cr_tpl_bytes_raw
+                    except Exception: pass
+                _cr_pipeline = st.session_state.get("pipeline_steps", {})
+                for _pk, _pl in {"upload":"Docs","extract":"Extract",
+                                  "research":"Research","analyze":"Analyze","generate":"Generate"}.items():
+                    _pd2 = _cr_pipeline.get(_pk, False)
+                    st.markdown(
+                        f'<div class="{"cr-step-done" if _pd2 else "cr-step-pend"}">'
+                        f'{"✓" if _pd2 else "○"} {_pl}</div>', unsafe_allow_html=True)
 
-            def _get_cr_tpl():
-                if _cr_tpl_up:
-                    _cr_tpl_up.seek(0); return _cr_tpl_up.read()
-                return st.session_state.get("saved_template_bytes") or _DEFAULT_TEMPLATE_BYTES
+        def _get_cr_tpl():
+            if _cr_tpl_up:
+                _cr_tpl_up.seek(0); return _cr_tpl_up.read()
+            return st.session_state.get("saved_template_bytes") or _DEFAULT_TEMPLATE_BYTES
 
-            # ── Reset output ──────────────────────────────────────
-            if st.session_state.get("pptx_bytes") or st.session_state.get("plan_slide_data"):
-                if st.button("🔄 Reset output", key="cr_reset_out"):
-                    for _rk in ["pptx_bytes","pptx_filename","plan_slide_data","plan_mode_active",
-                                 "plan_chat","plan_slide_history","pipeline_steps"]:
-                        st.session_state.pop(_rk, None)
+        # ── Reset output ──────────────────────────────────────
+        if st.session_state.get("pptx_bytes") or st.session_state.get("plan_slide_data"):
+            if st.button("🔄 Reset output", key="cr_reset_out"):
+                for _rk in ["pptx_bytes","pptx_filename","plan_slide_data","plan_mode_active",
+                             "plan_chat","plan_slide_history","pipeline_steps"]:
+                    st.session_state.pop(_rk, None)
+                st.rerun()
+
+        st.divider()
+
+        # ══════════════════════════════════════════════════════
+        # GUIDED MODE
+        # ══════════════════════════════════════════════════════
+        if _cr_mode == "💬 Guided (chat)":
+            if "guided_messages" not in st.session_state:
+                st.session_state["guided_messages"] = []
+            if "guided_ready" not in st.session_state:
+                st.session_state["guided_ready"] = False
+            if "guided_params" not in st.session_state:
+                st.session_state["guided_params"] = {}
+
+            _gl, _gr = st.columns([1, 1], gap="large")
+            with _gl:
+                _gchat = st.container(height=340)
+                with _gchat:
+                    if not st.session_state["guided_messages"]:
+                        st.caption("👋 Tell me about the presentation you need.")
+                    for _m in st.session_state["guided_messages"]:
+                        with st.chat_message(_m["role"]):
+                            st.markdown(_m["content"])
+
+                _gi = st.chat_input("Tell me about your presentation…", key="cr_guided_input")
+                if _gi:
+                    st.session_state["guided_messages"].append({"role": "user", "content": _gi})
+                    _gsys = (
+                        "You are a presentation planning assistant. Professional, direct, concise.\n"
+                        "Collect: topic, purpose, audience, slide count (default 10), focus areas.\n"
+                        "Once you have topic+purpose+audience, output the plan then the signal line.\n\n"
+                        "Format:\n**Topic:** [value]\n**Purpose:** [value]\n**Audience:** [value]\n"
+                        "**Slides:** [value]\n**Focus:** [core goal]\n\n"
+                        'READY_TO_GENERATE: {"topic":"...","purpose":"...","industry":"...","audience":"...","question":"...","slide_count":10}\n\n'
+                        "Populate all fields. Empty string for anything not discussed. No markdown fences."
+                    )
+                    try:
+                        _mac = _make_anthropic_client
+                        _grc = _mac().messages.create(
+                            model="us.anthropic.claude-sonnet-4-6", max_tokens=600, system=_gsys,
+                            messages=[{"role": m["role"], "content": m["content"]}
+                                      for m in st.session_state["guided_messages"]],
+                        )
+                        _rep = _grc.content[0].text if _grc.content else "Try again."
+                    except Exception as _ge2:
+                        _rep = f"(Error: {_ge2})"
+
+                    _clean = _rep
+                    if "READY_TO_GENERATE:" in _rep:
+                        try:
+                            import json as _jmod
+                            _jl = _rep.split("READY_TO_GENERATE:")[1].strip().split("\n")[0]
+                            _pp = _jmod.loads(_jl)
+                            st.session_state.update(guided_params=_pp, guided_ready=True)
+                            _clean = _rep.split("READY_TO_GENERATE:")[0].strip() or (
+                                f"**Topic:** {_pp.get('topic','')}\n"
+                                f"**Purpose:** {_pp.get('purpose','')}\n"
+                                f"**Audience:** {_pp.get('audience','')}\n"
+                                f"**Slides:** {_pp.get('slide_count',10)}\n\n"
+                                "Click **Generate** on the right when ready.")
+                        except Exception:
+                            st.session_state["guided_ready"] = False
+                    st.session_state["guided_messages"].append({"role": "assistant", "content": _clean})
                     st.rerun()
 
-            st.divider()
+                if st.button("🔄 Start over", key="cr_guided_reset", use_container_width=True):
+                    for _kk in ["guided_messages","guided_ready","guided_params",
+                                "guided_pptx_bytes","guided_pptx_filename"]:
+                        st.session_state.pop(_kk, None)
+                    st.rerun()
 
-            # ══════════════════════════════════════════════════════
-            # GUIDED MODE
-            # ══════════════════════════════════════════════════════
-            if _cr_mode == "💬 Guided (chat)":
-                if "guided_messages" not in st.session_state:
-                    st.session_state["guided_messages"] = []
-                if "guided_ready" not in st.session_state:
-                    st.session_state["guided_ready"] = False
-                if "guided_params" not in st.session_state:
-                    st.session_state["guided_params"] = {}
+            with _gr:
+                _gp   = st.session_state.get("guided_params", {})
+                _grdy = st.session_state.get("guided_ready", False)
+                if _grdy and _gp:
+                    st.success(
+                        f"**{_gp.get('topic','Topic')}**  \n"
+                        f"{_gp.get('purpose','')} · {_gp.get('audience','')} · "
+                        f"{_gp.get('slide_count',10)} slides")
+                    st.markdown(
+                        f'<div class="est-time">Estimated time: {_est_time(int(_gp.get("slide_count",10)))}</div>',
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="cr-status"><div class="cr-status-lbl">Waiting for plan</div>'
+                        '<div style="color:#6080A8;font-size:.82rem;line-height:1.9">'
+                        'Chat on the left. Once Claude has enough info the Generate button unlocks.'
+                        '</div></div>', unsafe_allow_html=True)
 
-                _gl, _gr = st.columns([1, 1], gap="large")
-                with _gl:
-                    _gchat = st.container(height=340)
-                    with _gchat:
-                        if not st.session_state["guided_messages"]:
-                            st.caption("👋 Tell me about the presentation you need.")
-                        for _m in st.session_state["guided_messages"]:
-                            with st.chat_message(_m["role"]):
-                                st.markdown(_m["content"])
+                _gbtn = st.button("⚡ Generate presentation", use_container_width=True,
+                                  type="primary", disabled=not _grdy, key="cr_guided_gen")
 
-                    _gi = st.chat_input("Tell me about your presentation…", key="cr_guided_input")
-                    if _gi:
-                        st.session_state["guided_messages"].append({"role": "user", "content": _gi})
-                        _gsys = (
-                            "You are a presentation planning assistant. Professional, direct, concise.\n"
-                            "Collect: topic, purpose, audience, slide count (default 10), focus areas.\n"
-                            "Once you have topic+purpose+audience, output the plan then the signal line.\n\n"
-                            "Format:\n**Topic:** [value]\n**Purpose:** [value]\n**Audience:** [value]\n"
-                            "**Slides:** [value]\n**Focus:** [core goal]\n\n"
-                            'READY_TO_GENERATE: {"topic":"...","purpose":"...","industry":"...","audience":"...","question":"...","slide_count":10}\n\n'
-                            "Populate all fields. Empty string for anything not discussed. No markdown fences."
-                        )
-                        try:
-                            _mac = _make_anthropic_client
-                            _grc = _mac().messages.create(
-                                model="us.anthropic.claude-sonnet-4-6", max_tokens=600, system=_gsys,
-                                messages=[{"role": m["role"], "content": m["content"]}
-                                          for m in st.session_state["guided_messages"]],
-                            )
-                            _rep = _grc.content[0].text if _grc.content else "Try again."
-                        except Exception as _ge2:
-                            _rep = f"(Error: {_ge2})"
+            _g_log  = st.empty()
+            _g_plan = st.container()
+            _g_dl   = st.empty()
 
-                        _clean = _rep
-                        if "READY_TO_GENERATE:" in _rep:
-                            try:
-                                import json as _jmod
-                                _jl = _rep.split("READY_TO_GENERATE:")[1].strip().split("\n")[0]
-                                _pp = _jmod.loads(_jl)
-                                st.session_state.update(guided_params=_pp, guided_ready=True)
-                                _clean = _rep.split("READY_TO_GENERATE:")[0].strip() or (
-                                    f"**Topic:** {_pp.get('topic','')}\n"
-                                    f"**Purpose:** {_pp.get('purpose','')}\n"
-                                    f"**Audience:** {_pp.get('audience','')}\n"
-                                    f"**Slides:** {_pp.get('slide_count',10)}\n\n"
-                                    "Click **Generate** on the right when ready.")
-                            except Exception:
-                                st.session_state["guided_ready"] = False
-                        st.session_state["guided_messages"].append({"role": "assistant", "content": _clean})
-                        st.rerun()
-
-                    if st.button("🔄 Start over", key="cr_guided_reset", use_container_width=True):
-                        for _kk in ["guided_messages","guided_ready","guided_params",
-                                    "guided_pptx_bytes","guided_pptx_filename"]:
-                            st.session_state.pop(_kk, None)
-                        st.rerun()
-
-                with _gr:
-                    _gp   = st.session_state.get("guided_params", {})
-                    _grdy = st.session_state.get("guided_ready", False)
-                    if _grdy and _gp:
-                        st.success(
-                            f"**{_gp.get('topic','Topic')}**  \n"
-                            f"{_gp.get('purpose','')} · {_gp.get('audience','')} · "
-                            f"{_gp.get('slide_count',10)} slides")
+            # Preview pane after outline is ready
+            if st.session_state.get("plan_mode_active") and not _gbtn:
+                with _g_plan:
+                    if st.session_state.get("plan_slide_data", {}).get("slides"):
+                        _prev_slides = st.session_state["plan_slide_data"]["slides"]
                         st.markdown(
-                            f'<div class="est-time">Estimated time: {_est_time(int(_gp.get("slide_count",10)))}</div>',
-                            unsafe_allow_html=True)
-                    else:
-                        st.markdown(
-                            '<div class="cr-status"><div class="cr-status-lbl">Waiting for plan</div>'
-                            '<div style="color:#6080A8;font-size:.82rem;line-height:1.9">'
-                            'Chat on the left. Once Claude has enough info the Generate button unlocks.'
-                            '</div></div>', unsafe_allow_html=True)
+                            f"**Outline preview — {len(_prev_slides)} slides · "
+                            f"{_est_time(len(_prev_slides))}**")
+                        _render_slide_preview(_prev_slides, editable=False, ns="cr_g_prev")
+                    _render_plan_modal(_get_cr_tpl(), ns="cr_guided")
 
-                    _gbtn = st.button("⚡ Generate presentation", use_container_width=True,
-                                      type="primary", disabled=not _grdy, key="cr_guided_gen")
+            if st.session_state.get("guided_pptx_bytes") and not _gbtn:
+                _g_dl.download_button("⬇️ Download PPTX",
+                    data=st.session_state["guided_pptx_bytes"],
+                    file_name=st.session_state.get("guided_pptx_filename","presentation.pptx"),
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True)
 
-                _g_log  = st.empty()
-                _g_plan = st.container()
-                _g_dl   = st.empty()
+            if _gbtn and _grdy and _gp:
+                _gt      = _get_cr_tpl()
+                _gtopic  = _gp.get("topic","")
+                st.session_state.update(proj_topic=_gtopic, proj_purpose=_gp.get("purpose",""),
+                    proj_industry=_gp.get("industry",""), proj_audience=_gp.get("audience",""))
+                _glogs = []
+                for _ev in _run_pipeline(
+                    model=_cr_model, uploaded_files=[],
+                    topic=_gtopic, purpose=_gp.get("purpose","General / Other"),
+                    industry=_gp.get("industry",""), audience=_gp.get("audience","General audience"),
+                    question=_gp.get("question",""), web_search_en=_cr_web,
+                    slide_count=int(_gp.get("slide_count",10)),
+                    theme=_cr_theme, template_bytes=_gt, plan_mode=True,
+                ):
+                    _et = _ev[0]
+                    if _et in ("log","spinner"):
+                        if _et=="spinner":
+                            if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
+                            _glogs.append(("spinner",_ev[1]))
+                        else:
+                            if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
+                            _glogs.append(("log",_ev[1]))
+                        _g_log.markdown(_render_log(_glogs), unsafe_allow_html=True)
+                    elif _et=="sources":
+                        if _cr_srcs_slide: st.session_state["research_sources"]=_ev[1]
+                    elif _et=="plan_ready":
+                        st.session_state["plan_slide_data"]=_ev[1]
+                        st.session_state["plan_mode_active"]=True
+                    elif _et=="pptx_bytes_out":
+                        _slg=_re.sub(r"[^a-zA-Z0-9]+","_",_gtopic)[:50]
+                        st.session_state["guided_pptx_bytes"]=_ev[1]
+                        st.session_state["guided_pptx_filename"]=f"Presentation_{_slg}.pptx"
+                        st.session_state["pptx_bytes"]=_ev[1]
+                    elif _et=="error": st.error(_ev[1],icon="🚨"); break
 
-                # Preview pane after outline is ready
-                if st.session_state.get("plan_mode_active") and not _gbtn:
+                # Show preview after generation
+                if st.session_state.get("plan_slide_data", {}).get("slides"):
+                    _prev_slides2 = st.session_state["plan_slide_data"]["slides"]
+                    st.markdown(f"**Outline — {len(_prev_slides2)} slides**")
+                    _render_slide_preview(_prev_slides2, editable=False, ns="cr_g_post")
+                if st.session_state.get("plan_mode_active"):
                     with _g_plan:
-                        if st.session_state.get("plan_slide_data", {}).get("slides"):
-                            _prev_slides = st.session_state["plan_slide_data"]["slides"]
-                            st.markdown(
-                                f"**Outline preview — {len(_prev_slides)} slides · "
-                                f"{_est_time(len(_prev_slides))}**")
-                            _render_slide_preview(_prev_slides, editable=False, ns="cr_g_prev")
                         _render_plan_modal(_get_cr_tpl(), ns="cr_guided")
+                _srcs3 = st.session_state.get("research_sources", [])
+                if _srcs3:
+                    with st.expander(f"🔗 {len(_srcs3)} source(s)"):
+                        for _s3 in _srcs3: st.markdown(f"- [{_s3.get('title',_s3.get('url',''))}]({_s3.get('url','')})")
 
-                if st.session_state.get("guided_pptx_bytes") and not _gbtn:
-                    _g_dl.download_button("⬇️ Download PPTX",
-                        data=st.session_state["guided_pptx_bytes"],
-                        file_name=st.session_state.get("guided_pptx_filename","presentation.pptx"),
+        # ══════════════════════════════════════════════════════
+        # QUICK FORM MODE
+        # ══════════════════════════════════════════════════════
+        else:
+            _fc1, _fc2 = st.columns([1, 1], gap="large")
+            with _fc1:
+                st.markdown('<div class="cr-section">Topic &amp; documents</div>', unsafe_allow_html=True)
+                _topic    = st.text_input("Topic / title",
+                    value=st.session_state.get("proj_topic",""),
+                    placeholder="e.g. Q3 Market Analysis, Product Launch…", key="cr_topic")
+                _purpose  = st.selectbox("Purpose", list(PURPOSE_PRESETS.keys()), key="cr_purpose")
+                _industry = st.text_input("Industry / context",
+                    value=st.session_state.get("proj_industry",""),
+                    placeholder="e.g. Healthcare, Gaming…", key="cr_industry")
+                _audience = st.text_input("Audience",
+                    value=st.session_state.get("proj_audience",""),
+                    placeholder="e.g. Executive team, Board…", key="cr_audience")
+                _question = st.text_area("Business question / goal",
+                    placeholder="What question should this deck answer?",
+                    height=72, key="cr_question")
+                _uploads  = st.file_uploader("Supporting documents",
+                    type=["pdf","docx","txt","csv","xlsx"],
+                    accept_multiple_files=True, key="cr_uploads")
+
+            with _fc2:
+                st.markdown('<div class="cr-section">Output</div>', unsafe_allow_html=True)
+                _out_area = st.empty()
+                _dl_area  = st.empty()
+
+                if st.session_state.get("plan_mode_active") and not st.session_state.get("cr_run_clicked"):
+                    with _out_area.container():
+                        if st.session_state.get("plan_slide_data", {}).get("slides"):
+                            _prev3 = st.session_state["plan_slide_data"]["slides"]
+                            st.markdown(f"**Outline preview — {len(_prev3)} slides**")
+                            _render_slide_preview(_prev3, editable=False, ns="cr_f_prev")
+                        _render_plan_modal(_get_cr_tpl(), ns="cr_main")
+                if st.session_state.get("pptx_bytes") and not st.session_state.get("cr_run_clicked"):
+                    _dl_area.download_button("⬇️ Download previous PPTX",
+                        data=st.session_state["pptx_bytes"],
+                        file_name=st.session_state.get("pptx_filename","presentation.pptx"),
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         use_container_width=True)
 
-                if _gbtn and _grdy and _gp:
-                    _gt      = _get_cr_tpl()
-                    _gtopic  = _gp.get("topic","")
-                    st.session_state.update(proj_topic=_gtopic, proj_purpose=_gp.get("purpose",""),
-                        proj_industry=_gp.get("industry",""), proj_audience=_gp.get("audience",""))
-                    _glogs = []
-                    for _ev in _run_pipeline(
-                        model=_cr_model, uploaded_files=[],
-                        game_title=_gtopic,
-                        business_question=_gp.get("question",""),
-                        audience=_gp.get("audience","General audience"),
-                        theme_preset=st.session_state.get("cr_theme", list(THEME_PRESETS.keys())[0]),
-                        web_search_en=_cr_web,
-                        slide_count=int(_gp.get("slide_count",10)),
-                        template_bytes=_gt, plan_mode=True,
-                    ):
-                        _et = _ev[0]
-                        if _et in ("log","spinner"):
-                            if _et=="spinner":
-                                if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
-                                _glogs.append(("spinner",_ev[1]))
-                            else:
-                                if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
-                                _glogs.append(("log",_ev[1]))
-                            _g_log.markdown(_render_log(_glogs), unsafe_allow_html=True)
-                        elif _et=="sources":
-                            if _cr_srcs_slide: st.session_state["research_sources"]=_ev[1]
-                        elif _et=="plan_ready":
-                            st.session_state["plan_slide_data"]=_ev[1]
-                            st.session_state["plan_mode_active"]=True
-                        elif _et=="pptx_bytes_out":
-                            _slg=_re.sub(r"[^a-zA-Z0-9]+","_",_gtopic)[:50]
-                            st.session_state["guided_pptx_bytes"]=_ev[1]
-                            st.session_state["guided_pptx_filename"]=f"Presentation_{_slg}.pptx"
-                            st.session_state["pptx_bytes"]=_ev[1]
-                        elif _et=="error": st.error(_ev[1],icon="🚨"); break
+            _run_btn = st.button("⚡ Generate presentation", use_container_width=True,
+                                 type="primary", key="cr_run_btn")
+            st.session_state["cr_run_clicked"] = _run_btn
 
-                    # Show preview after generation
-                    if st.session_state.get("plan_slide_data", {}).get("slides"):
-                        _prev_slides2 = st.session_state["plan_slide_data"]["slides"]
-                        st.markdown(f"**Outline — {len(_prev_slides2)} slides**")
-                        _render_slide_preview(_prev_slides2, editable=False, ns="cr_g_post")
+            if _run_btn:
+                if not _topic.strip():
+                    st.error("Please enter a topic.")
+                else:
+                    st.session_state.update(
+                        proj_topic=_topic, proj_purpose=_purpose,
+                        proj_industry=_industry, proj_audience=_audience,
+                        project_doc_names=[f.name for f in (_uploads or [])])
+                    _tpl2 = _get_cr_tpl()
+                    _pipe = {"upload":bool(_uploads),"extract":False,
+                             "research":False,"analyze":False,"generate":False}
+                    st.session_state["pipeline_steps"] = _pipe
+                    _logs2 = []
+
+                    with _out_area.container():
+                        _la2 = st.empty()
+                        try:
+                            for _ev2 in _run_pipeline(
+                                model=_cr_model, uploaded_files=_uploads or [],
+                                topic=_topic, purpose=_purpose,
+                                industry=_industry, audience=_audience,
+                                question=_question, web_search_en=_cr_web,
+                                slide_count=_cr_slides, theme=_cr_theme,
+                                template_bytes=_tpl2, plan_mode=True,
+                            ):
+                                _et2 = _ev2[0]
+                                if _et2 in ("log","spinner"):
+                                    if _et2=="spinner":
+                                        if _logs2 and _logs2[-1][0]=="spinner":
+                                            _logs2[-1]=("log",_logs2[-1][1])
+                                        _logs2.append(("spinner",_ev2[1]))
+                                    else:
+                                        if _logs2 and _logs2[-1][0]=="spinner":
+                                            _logs2[-1]=("log",_logs2[-1][1])
+                                        _logs2.append(("log",_ev2[1]))
+                                    _la2.markdown(_render_log(_logs2),unsafe_allow_html=True)
+                                elif _et2=="step_done":
+                                    _pipe[_ev2[1]]=True
+                                    st.session_state["pipeline_steps"]=_pipe
+                                elif _et2=="sources":
+                                    if _cr_srcs_slide: st.session_state["research_sources"]=_ev2[1]
+                                elif _et2=="plan_ready":
+                                    st.session_state["plan_slide_data"]=_ev2[1]
+                                    st.session_state["plan_mode_active"]=True
+                                elif _et2=="pptx_bytes_out":
+                                    _slg2=_re.sub(r"[^a-zA-Z0-9]+","_",_topic)[:50]
+                                    st.session_state["pptx_bytes"]=_ev2[1]
+                                    st.session_state["pptx_filename"]=f"Presentation_{_slg2}.pptx"
+                                elif _et2=="error":
+                                    st.error(_ev2[1],icon="🚨"); break
+                        except Exception as _ex2:
+                            st.error(f"Error: {_ex2}")
+                            import traceback; st.code(traceback.format_exc())
+
                     if st.session_state.get("plan_mode_active"):
-                        with _g_plan:
-                            _render_plan_modal(_get_cr_tpl(), ns="cr_guided")
-                    _srcs3 = st.session_state.get("research_sources", [])
-                    if _srcs3:
-                        with st.expander(f"🔗 {len(_srcs3)} source(s)"):
-                            for _s3 in _srcs3: st.markdown(f"- [{_s3.get('title',_s3.get('url',''))}]({_s3.get('url','')})")
-
-            # ══════════════════════════════════════════════════════
-            # QUICK FORM MODE
-            # ══════════════════════════════════════════════════════
-            else:
-                _fc1, _fc2 = st.columns([1, 1], gap="large")
-                with _fc1:
-                    st.markdown('<div class="cr-section">Topic &amp; documents</div>', unsafe_allow_html=True)
-                    _topic    = st.text_input("Topic / title",
-                        value=st.session_state.get("proj_topic",""),
-                        placeholder="e.g. Q3 Market Analysis, Product Launch…", key="cr_topic")
-                    _purpose  = st.selectbox("Purpose", list(PURPOSE_PRESETS.keys()), key="cr_purpose")
-                    _industry = st.text_input("Industry / context",
-                        value=st.session_state.get("proj_industry",""),
-                        placeholder="e.g. Healthcare, Gaming…", key="cr_industry")
-                    _audience = st.text_input("Audience",
-                        value=st.session_state.get("proj_audience",""),
-                        placeholder="e.g. Executive team, Board…", key="cr_audience")
-                    _question = st.text_area("Business question / goal",
-                        placeholder="What question should this deck answer?",
-                        height=72, key="cr_question")
-                    _uploads  = st.file_uploader("Supporting documents",
-                        type=["pdf","docx","txt","csv","xlsx"],
-                        accept_multiple_files=True, key="cr_uploads")
-
-                with _fc2:
-                    st.markdown('<div class="cr-section">Output</div>', unsafe_allow_html=True)
-                    _out_area = st.empty()
-                    _dl_area  = st.empty()
-
-                    if st.session_state.get("plan_mode_active") and not st.session_state.get("cr_run_clicked"):
+                        if st.session_state.get("plan_slide_data", {}).get("slides"):
+                            _prev4 = st.session_state["plan_slide_data"]["slides"]
+                            st.markdown(f"**Outline — {len(_prev4)} slides**")
+                            _render_slide_preview(_prev4, editable=False, ns="cr_f_post")
                         with _out_area.container():
-                            if st.session_state.get("plan_slide_data", {}).get("slides"):
-                                _prev3 = st.session_state["plan_slide_data"]["slides"]
-                                st.markdown(f"**Outline preview — {len(_prev3)} slides**")
-                                _render_slide_preview(_prev3, editable=False, ns="cr_f_prev")
                             _render_plan_modal(_get_cr_tpl(), ns="cr_main")
-                    if st.session_state.get("pptx_bytes") and not st.session_state.get("cr_run_clicked"):
-                        _dl_area.download_button("⬇️ Download previous PPTX",
+                    if st.session_state.get("pptx_bytes"):
+                        st.success("Presentation ready!")
+                        _dl_area.download_button("⬇️ Download PPTX",
                             data=st.session_state["pptx_bytes"],
                             file_name=st.session_state.get("pptx_filename","presentation.pptx"),
                             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                             use_container_width=True)
+                        _src4=st.session_state.get("research_sources",[])
+                        if _src4:
+                            with st.expander(f"🔗 {len(_src4)} source(s)"):
+                                for _s4 in _src4:
+                                    st.markdown(f"- [{_s4.get('title',_s4.get('url',''))}]({_s4.get('url','')})")
 
-                _run_btn = st.button("⚡ Generate presentation", use_container_width=True,
-                                     type="primary", key="cr_run_btn")
-                st.session_state["cr_run_clicked"] = _run_btn
-
-                if _run_btn:
-                    if not _topic.strip():
-                        st.error("Please enter a topic.")
-                    else:
-                        st.session_state.update(
-                            proj_topic=_topic, proj_purpose=_purpose,
-                            proj_industry=_industry, proj_audience=_audience,
-                            project_doc_names=[f.name for f in (_uploads or [])])
-                        _tpl2 = _get_cr_tpl()
-                        _pipe = {"upload":bool(_uploads),"extract":False,
-                                 "research":False,"analyze":False,"generate":False}
-                        st.session_state["pipeline_steps"] = _pipe
-                        _logs2 = []
-
-                        with _out_area.container():
-                            _la2 = st.empty()
-                            try:
-                                for _ev2 in _run_pipeline(
-                                    model=_cr_model, uploaded_files=_uploads or [],
-                                    game_title=_topic,
-                                    business_question=_question,
-                                    audience=_audience,
-                                    theme_preset=st.session_state.get("cr_theme", list(THEME_PRESETS.keys())[0]),
-                                    web_search_en=_cr_web,
-                                    slide_count=_cr_slides,
-                                    template_bytes=_tpl2, plan_mode=True,
-                                ):
-                                    _et2 = _ev2[0]
-                                    if _et2 in ("log","spinner"):
-                                        if _et2=="spinner":
-                                            if _logs2 and _logs2[-1][0]=="spinner":
-                                                _logs2[-1]=("log",_logs2[-1][1])
-                                            _logs2.append(("spinner",_ev2[1]))
-                                        else:
-                                            if _logs2 and _logs2[-1][0]=="spinner":
-                                                _logs2[-1]=("log",_logs2[-1][1])
-                                            _logs2.append(("log",_ev2[1]))
-                                        _la2.markdown(_render_log(_logs2),unsafe_allow_html=True)
-                                    elif _et2=="step_done":
-                                        _pipe[_ev2[1]]=True
-                                        st.session_state["pipeline_steps"]=_pipe
-                                    elif _et2=="sources":
-                                        if _cr_srcs_slide: st.session_state["research_sources"]=_ev2[1]
-                                    elif _et2=="plan_ready":
-                                        st.session_state["plan_slide_data"]=_ev2[1]
-                                        st.session_state["plan_mode_active"]=True
-                                    elif _et2=="pptx_bytes_out":
-                                        _slg2=_re.sub(r"[^a-zA-Z0-9]+","_",_topic)[:50]
-                                        st.session_state["pptx_bytes"]=_ev2[1]
-                                        st.session_state["pptx_filename"]=f"Presentation_{_slg2}.pptx"
-                                    elif _et2=="error":
-                                        st.error(_ev2[1],icon="🚨"); break
-                            except Exception as _ex2:
-                                st.error(f"Error: {_ex2}")
-                                import traceback; st.code(traceback.format_exc())
-
-                        if st.session_state.get("plan_mode_active"):
-                            if st.session_state.get("plan_slide_data", {}).get("slides"):
-                                _prev4 = st.session_state["plan_slide_data"]["slides"]
-                                st.markdown(f"**Outline — {len(_prev4)} slides**")
-                                _render_slide_preview(_prev4, editable=False, ns="cr_f_post")
-                            with _out_area.container():
-                                _render_plan_modal(_get_cr_tpl(), ns="cr_main")
-                        if st.session_state.get("pptx_bytes"):
-                            st.success("Presentation ready!")
-                            _dl_area.download_button("⬇️ Download PPTX",
-                                data=st.session_state["pptx_bytes"],
-                                file_name=st.session_state.get("pptx_filename","presentation.pptx"),
-                                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                                use_container_width=True)
-                            _src4=st.session_state.get("research_sources",[])
-                            if _src4:
-                                with st.expander(f"🔗 {len(_src4)} source(s)"):
-                                    for _s4 in _src4:
-                                        st.markdown(f"- [{_s4.get('title',_s4.get('url',''))}]({_s4.get('url','')})")
-
-            # ══ EDIT OUTLINE ══════════════════════════════════════
-            if st.session_state.get("plan_slide_data"):
-                st.divider()
-                st.markdown("### ✏️ Edit outline")
-                if st.session_state.get("plan_slide_data", {}).get("slides"):
-                    _edit_slides = st.session_state["plan_slide_data"]["slides"]
-                    _edited2 = _render_slide_preview(_edit_slides, editable=True, ns="cr_edit")
-                    if st.button("✅ Save outline edits", key="cr_save_edits"):
-                        st.session_state["plan_slide_data"]["slides"] = [
-                            {k: v for k, v in s.items() if k != "slide_number"} for s in _edited2]
-                        st.rerun()
-                _render_plan_modal(_get_cr_tpl(), ns="cr_edit_modal")
-            elif st.session_state.get("pptx_bytes"):
-                st.info("Outline not available for this PPTX — generate a new presentation to edit inline.")
-
+        # ══ EDIT OUTLINE ══════════════════════════════════════
+        if st.session_state.get("plan_slide_data"):
+            st.divider()
+            st.markdown("### ✏️ Edit outline")
+            if st.session_state.get("plan_slide_data", {}).get("slides"):
+                _edit_slides = st.session_state["plan_slide_data"]["slides"]
+                _edited2 = _render_slide_preview(_edit_slides, editable=True, ns="cr_edit")
+                if st.button("✅ Save outline edits", key="cr_save_edits"):
+                    st.session_state["plan_slide_data"]["slides"] = [
+                        {k: v for k, v in s.items() if k != "slide_number"} for s in _edited2]
+                    st.rerun()
+            _render_plan_modal(_get_cr_tpl(), ns="cr_edit_modal")
+        elif st.session_state.get("pptx_bytes"):
+            st.info("Outline not available for this PPTX — generate a new presentation to edit inline.")
 
 
 
